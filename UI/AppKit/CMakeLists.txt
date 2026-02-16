@@ -13,6 +13,7 @@ add_library(ladybird_impl STATIC
     Interface/SearchPanel.mm
     Interface/Tab.mm
     Interface/TabController.mm
+    Interface/TabSidebar.mm
     Utilities/Conversions.mm
 )
 target_include_directories(ladybird_impl PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
@@ -30,3 +31,4 @@ target_link_libraries(ladybird_impl PUBLIC "-framework Cocoa -framework UniformT
 target_link_libraries(ladybird PRIVATE ladybird_impl)
 
 create_ladybird_bundle(ladybird)
+

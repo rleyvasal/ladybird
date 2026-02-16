@@ -15,6 +15,7 @@
 #import <Interface/Menu.h>
 #import <Interface/Tab.h>
 #import <Interface/TabController.h>
+#import <Interface/TabSidebar.h>
 #import <Utilities/Conversions.h>
 
 #if !__has_feature(objc_arc)
@@ -69,6 +70,9 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
 @property (nonatomic, strong) NSToolbarItem* zoom_toolbar_item;
 @property (nonatomic, strong) NSToolbarItem* new_tab_toolbar_item;
 @property (nonatomic, strong) NSToolbarItem* tab_overview_toolbar_item;
+
+@property (nonatomic, strong) TabSidebar* sidebar;
+@property (nonatomic, assign) BOOL isResizing;
 
 @property (nonatomic, strong) Autocomplete* autocomplete;
 
@@ -387,12 +391,64 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
     [self.window setToolbar:self.toolbar];
     [self.window setToolbarStyle:NSWindowToolbarStyleUnified];
 
+    // Create sidebar
+    self.sidebar = [[TabSidebar alloc] init];
+    CGFloat toolbarHeight = 52;  // TODO: make dynamic
+    [self.sidebar setFrame:NSMakeRect(8, 8, 0, self.window.frame.size.height - toolbarHeight - 16)];
+    [[self.window contentView] addSubview:self.sidebar];
+
+    // Add tracking area for hover detection
+    NSTrackingArea* hoverArea = [[NSTrackingArea alloc]
+        initWithRect:NSMakeRect(0, 0, 58, self.window.frame.size.height)
+        options:(NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways)
+        owner:self
+        userInfo:nil];
+    [[self.window contentView] addTrackingArea:hoverArea];
+
     [self.window makeKeyAndOrderFront:sender];
 
     [self focusLocationToolbarItem];
 
     auto* delegate = (ApplicationDelegate*)[NSApp delegate];
     [delegate setActiveTab:[self tab]];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    NSPoint mouseLocation = [self.window mouseLocationOutsideOfEventStream];
+    if (mouseLocation.x < 10) {
+        self.isResizing = YES;
+        // Collapse sidebar immediately
+        CGFloat toolbarHeight = 52;
+        [self.sidebar setFrame:NSMakeRect(8, 8, 0, self.window.frame.size.height - toolbarHeight - 16)];
+    }
+}
+
+- (void)mouseUp:(NSEvent*)event {
+    self.isResizing = NO;
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+    if (self.window.inLiveResize) return;
+
+    NSPoint mouseLocation = [self.window mouseLocationOutsideOfEventStream];
+    CGFloat windowHeight = self.window.frame.size.height;
+    if (mouseLocation.y < 30 || mouseLocation.y > windowHeight - 30) return;  // Ignore corners
+    if (mouseLocation.x <= 58) {
+        CGFloat toolbarHeight = 52;  // TODO: make dynamic
+        [[self.sidebar animator] setFrame:NSMakeRect(8, 8, 50, self.window.frame.size.height - toolbarHeight - 16)];
+    }
+}
+
+- (void)mouseExited:(NSEvent*)event {
+    NSPoint mouseLocation = [self.window mouseLocationOutsideOfEventStream];
+    NSRect windowFrame = [self.window frame];
+    NSPoint screenMouse = [NSEvent mouseLocation];
+    BOOL mouseOutsideWindow = !NSPointInRect(screenMouse, windowFrame);
+
+    if (mouseLocation.x > 58 || mouseOutsideWindow) {
+        CGFloat toolbarHeight = 52;  // TODO: make dynamic
+        [[self.sidebar animator] setFrame:NSMakeRect(8, 8, 0, self.window.frame.size.height - toolbarHeight - 16)];
+    }
 }
 
 #pragma mark - NSWindowDelegate
@@ -430,6 +486,16 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
     [[[self tab] web_view] setWindowPosition:position];
 }
 
+- (void)windowWillStartLiveResize:(NSNotification*)notification
+{
+    self.isResizing = YES;
+}
+
+- (void)windowDidEndLiveResize:(NSNotification*)notification
+{
+    self.isResizing = NO;
+}
+
 - (void)windowDidResize:(NSNotification*)notification
 {
     if (self.location_toolbar_item_width != nil) {
@@ -441,6 +507,14 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
     self.location_toolbar_item_width.active = YES;
 
     [[[self tab] web_view] handleResize];
+
+    // Collapse sidebar during resize
+    CGFloat toolbarHeight = 52;  // TODO: make dynamic
+    [self.sidebar setFrame:NSMakeRect(8, 8, 0, self.window.frame.size.height - toolbarHeight - 16)];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        self.isResizing = NO;
+    });
 }
 
 - (void)windowDidChangeBackingProperties:(NSNotification*)notification
@@ -555,3 +629,32 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
 }
 
 @end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
