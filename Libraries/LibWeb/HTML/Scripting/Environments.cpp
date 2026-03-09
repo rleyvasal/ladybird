@@ -547,16 +547,15 @@ JS::Object& entry_global_object()
 bool is_secure_context(Environment const& environment)
 {
     // 1. If environment is an environment settings object, then:
-    if (is<EnvironmentSettingsObject>(environment)) {
+    if (auto const* environment_settings_object = as_if<EnvironmentSettingsObject>(environment)) {
         // 1. Let global be environment's global object.
-        // FIXME: Add a const global_object() getter to ESO
-        auto& global = static_cast<EnvironmentSettingsObject&>(const_cast<Environment&>(environment)).global_object();
+        auto const& global = environment_settings_object->global_object();
 
         // 2. If global is a WorkerGlobalScope, then:
-        if (is<WorkerGlobalScope>(global)) {
-            // FIXME: 1. If global's owner set[0]'s relevant settings object is a secure context, then return true.
+        if (auto const* worker = as_if<WorkerGlobalScope>(global)) {
+            // 1. If global's owner set[0]'s relevant settings object is a secure context, then return true.
             // NOTE: We only need to check the 0th item since they will necessarily all be consistent.
-            if (true)
+            if (worker->owner_set().at(0).visit([](auto const& owner) { return owner.relevant_settings_object_is_secure_context; }))
                 return true;
 
             // 2. Return false.
@@ -584,6 +583,22 @@ bool is_non_secure_context(Environment const& environment)
 
 SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
 {
+    auto serialized_global = [this]() -> SerializedGlobal {
+        bool relevant_settings_object_is_secure_context = is_secure_context(*this);
+        if (auto const* window = as_if<Window>(global_object())) {
+            return SerializedWindow {
+                .associated_document {
+                    .url = window->associated_document().url(),
+                    .relevant_settings_object_is_secure_context = relevant_settings_object_is_secure_context,
+                }
+            };
+        }
+        VERIFY(is<WorkerGlobalScope>(global_object()));
+        return SerializedWorkerGlobalScope {
+            .relevant_settings_object_is_secure_context = relevant_settings_object_is_secure_context,
+        };
+    }();
+
     return SerializedEnvironmentSettingsObject {
         .id = this->id,
         .creation_url = this->creation_url,
@@ -595,6 +610,7 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
         .policy_container = policy_container()->serialize(),
         .cross_origin_isolated_capability = cross_origin_isolated_capability(),
         .time_origin = this->time_origin(),
+        .global = move(serialized_global),
     };
 }
 

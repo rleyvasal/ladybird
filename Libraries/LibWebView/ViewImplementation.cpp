@@ -17,7 +17,6 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/Menu.h>
-#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/ViewImplementation.h>
@@ -106,6 +105,9 @@ void ViewImplementation::create_new_process_for_cross_site_navigation(URL::URL c
 
     initialize_client();
     VERIFY(m_client_state.client);
+
+    if (on_web_content_process_change_for_cross_site_navigation)
+        on_web_content_process_change_for_cross_site_navigation();
 
     // Don't keep a stale backup bitmap around.
     m_backup_bitmap = nullptr;
@@ -473,6 +475,11 @@ void ViewImplementation::js_console_input(String const& js_source)
     client().async_js_console_input(page_id(), js_source);
 }
 
+void ViewImplementation::exit_fullscreen()
+{
+    client().async_exit_fullscreen(page_id());
+}
+
 void ViewImplementation::alert_closed()
 {
     client().async_alert_closed(page_id());
@@ -582,13 +589,18 @@ void ViewImplementation::did_allocate_iosurface_backing_stores(i32 front_id, Cor
 
     auto bytes_per_row = front_iosurface.bytes_per_row();
 
+    auto* front_ref = front_iosurface.core_foundation_pointer();
+    auto* back_ref = back_iosurface.core_foundation_pointer();
+
     auto front_bitmap = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, front_size, bytes_per_row, front_iosurface.data(), [handle = move(front_iosurface)] { });
     auto back_bitmap = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, back_size, bytes_per_row, back_iosurface.data(), [handle = move(back_iosurface)] { });
 
     m_client_state.front_bitmap.bitmap = front_bitmap.release_value_but_fixme_should_propagate_errors();
     m_client_state.front_bitmap.id = front_id;
+    m_client_state.front_bitmap.iosurface_ref = front_ref;
     m_client_state.back_bitmap.bitmap = back_bitmap.release_value_but_fixme_should_propagate_errors();
     m_client_state.back_bitmap.id = back_id;
+    m_client_state.back_bitmap.iosurface_ref = back_ref;
 }
 #endif
 
@@ -606,7 +618,7 @@ void ViewImplementation::update_zoom()
 
 void ViewImplementation::handle_resize()
 {
-    client().async_set_viewport_size(page_id(), this->viewport_size());
+    client().async_set_viewport(page_id(), this->viewport_size(), m_device_pixel_ratio);
 }
 
 void ViewImplementation::initialize_client(CreateNewClient create_new_client)
@@ -623,7 +635,7 @@ void ViewImplementation::initialize_client(CreateNewClient create_new_client)
     m_client_state.client_handle = MUST(Web::Crypto::generate_random_uuid());
     client().async_set_window_handle(m_client_state.page_index, m_client_state.client_handle);
     client().async_set_zoom_level(m_client_state.page_index, m_zoom_level);
-    client().async_set_device_pixel_ratio(m_client_state.page_index, m_device_pixel_ratio);
+    client().async_set_viewport(m_client_state.page_index, viewport_size(), m_device_pixel_ratio);
     client().async_set_maximum_frames_per_second(m_client_state.page_index, m_maximum_frames_per_second);
     client().async_set_system_visibility_state(m_client_state.page_index, m_system_visibility_state);
     client().async_set_document_cookie_version_buffer(m_client_state.page_index, m_document_cookie_version_buffer);
@@ -975,6 +987,12 @@ void ViewImplementation::initialize_context_menus()
     m_media_loop_action = Action::create_checkable("Loop"sv, ActionID::ToggleMediaLoopState, [this]() {
         client().async_toggle_media_loop_state(page_id());
     });
+    m_media_enter_fullscreen_action = Action::create("Full Screen"sv, ActionID::EnterFullscreen, [this]() {
+        client().async_toggle_media_fullscreen_state(page_id());
+    });
+    m_media_exit_fullscreen_action = Action::create("Exit Full Screen"sv, ActionID::ExitFullscreen, [this]() {
+        client().async_toggle_media_fullscreen_state(page_id());
+    });
 
     m_page_context_menu = Menu::create("Page Context Menu"sv);
     m_page_context_menu->add_action(*m_navigate_back_action);
@@ -1013,6 +1031,8 @@ void ViewImplementation::initialize_context_menus()
     m_media_context_menu->add_action(*m_media_show_controls_action);
     m_media_context_menu->add_action(*m_media_hide_controls_action);
     m_media_context_menu->add_action(*m_media_loop_action);
+    m_media_context_menu->add_action(*m_media_enter_fullscreen_action);
+    m_media_context_menu->add_action(*m_media_exit_fullscreen_action);
     m_media_context_menu->add_separator();
     m_media_context_menu->add_action(*m_open_audio_action);
     m_media_context_menu->add_action(*m_open_video_action);
@@ -1095,6 +1115,9 @@ void ViewImplementation::did_request_media_context_menu(Badge<WebContentClient>,
     m_media_hide_controls_action->set_visible(menu.has_user_agent_controls);
 
     m_media_loop_action->set_checked(menu.is_looping);
+
+    m_media_enter_fullscreen_action->set_visible(menu.is_video && !menu.is_fullscreen);
+    m_media_exit_fullscreen_action->set_visible(menu.is_video && menu.is_fullscreen);
 
     if (m_media_context_menu->on_activation)
         m_media_context_menu->on_activation(to_widget_position(content_position));

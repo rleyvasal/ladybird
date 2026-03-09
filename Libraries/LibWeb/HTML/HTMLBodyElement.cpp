@@ -5,6 +5,7 @@
  */
 
 #include <LibWeb/Bindings/HTMLBodyElementPrototype.h>
+#include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
@@ -140,7 +141,7 @@ void HTMLBodyElement::attribute_changed(FlyString const& name, Optional<String> 
             m_background_style_value = CSS::ImageStyleValue::create(maybe_background_url.value());
             m_background_style_value->on_animate = [this] {
                 if (paintable())
-                    paintable()->set_needs_display();
+                    paintable()->set_needs_repaint();
             };
         }
     }

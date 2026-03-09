@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/QuickSort.h>
 #include <AK/String.h>
 #include <LibJS/Parser.h>
 #include <LibJS/ScopeCollector.h>
@@ -163,8 +164,6 @@ void ScopeCollector::add_declaration(NonnullRefPtr<Declaration const> declaratio
                 VERIFY(scope->parent != nullptr);
                 scope = scope->parent;
             }
-            VERIFY(scope->is_top_level() && scope->ast_node);
-            scope->ast_node->add_var_scoped_declaration(declaration);
         }));
 
         VERIFY(m_current->top_level);
@@ -210,6 +209,8 @@ void ScopeCollector::register_identifier(NonnullRefPtr<Identifier> id, Optional<
 {
     if (auto maybe_identifier_group = m_current->identifier_groups.get(id->string()); maybe_identifier_group.has_value()) {
         maybe_identifier_group.value().identifiers.append(id);
+        if (declaration_kind.has_value() && !maybe_identifier_group.value().declaration_kind.has_value())
+            maybe_identifier_group.value().declaration_kind = declaration_kind;
     } else {
         m_current->identifier_groups.set(id->string(), IdentifierGroup {
                                                            .captured_by_nested_function = false,
@@ -223,6 +224,9 @@ void ScopeCollector::set_function_parameters(NonnullRefPtr<FunctionParameters co
 {
     m_current->function_parameters = move(parameters);
     for (auto& parameter : m_current->function_parameters->parameters()) {
+        if (parameter.default_value)
+            m_current->has_parameter_expressions = true;
+
         parameter.binding.visit(
             [&](Identifier const& identifier) {
                 register_identifier(fixme_launder_const_through_pointer_cast(identifier));
@@ -230,6 +234,9 @@ void ScopeCollector::set_function_parameters(NonnullRefPtr<FunctionParameters co
                 var.flags |= ScopeVariable::IsParameterCandidate | ScopeVariable::IsForbiddenLexical;
             },
             [&](NonnullRefPtr<BindingPattern const> const& binding_pattern) {
+                if (binding_pattern->contains_expression())
+                    m_current->has_parameter_expressions = true;
+
                 // NOTE: Nothing in the callback throws an exception.
                 MUST(binding_pattern->for_each_bound_identifier([&](auto const& identifier) {
                     register_identifier(fixme_launder_const_through_pointer_cast(identifier));
@@ -237,6 +244,17 @@ void ScopeCollector::set_function_parameters(NonnullRefPtr<FunctionParameters co
                     var.flags |= ScopeVariable::IsParameterCandidate | ScopeVariable::IsForbiddenLexical;
                 }));
             });
+    }
+
+    // Mark non-parameter names that were referenced during formal parameter
+    // parsing (i.e. in default value expressions). If a body var later
+    // declares the same name, it must not be optimized to a local, since the
+    // default expression needs to resolve it from the outer scope.
+    if (m_current->has_parameter_expressions) {
+        for (auto& [name, group] : m_current->identifier_groups) {
+            if (!m_current->has_variable_with_flags(name, ScopeVariable::IsForbiddenLexical))
+                m_current->variables.ensure(name).flags |= ScopeVariable::IsReferencedInFormalParameters;
+        }
     }
 }
 
@@ -282,6 +300,25 @@ void ScopeCollector::set_uses_new_target()
 void ScopeCollector::set_is_arrow_function() { m_current->is_arrow_function = true; }
 void ScopeCollector::set_is_function_declaration() { m_current->is_function_declaration = true; }
 
+Vector<ScopeCollector::SavedAncestorFlags> ScopeCollector::save_ancestor_flags() const
+{
+    Vector<SavedAncestorFlags> saved;
+    for (auto* scope = m_current; scope; scope = scope->parent) {
+        if (scope->type == ScopeRecord::ScopeType::Function) {
+            saved.append({ scope, scope->uses_this, scope->uses_this_from_environment });
+        }
+    }
+    return saved;
+}
+
+void ScopeCollector::restore_ancestor_flags(Vector<SavedAncestorFlags> const& saved)
+{
+    for (auto const& entry : saved) {
+        entry.record->uses_this = entry.uses_this;
+        entry.record->uses_this_from_environment = entry.uses_this_from_environment;
+    }
+}
+
 bool ScopeCollector::contains_direct_call_to_eval() const { return m_current->contains_direct_call_to_eval; }
 bool ScopeCollector::uses_this_from_environment() const { return m_current->uses_this_from_environment; }
 bool ScopeCollector::uses_this() const { return m_current->uses_this; }
@@ -325,23 +362,23 @@ void ScopeCollector::throw_identifier_declared(Utf16FlyString const& name, Nonnu
 
 // --- Post-parse analysis ---
 
-void ScopeCollector::analyze()
+void ScopeCollector::analyze(bool suppress_globals)
 {
     if (m_root)
-        analyze_recursive(*m_root);
+        analyze_recursive(*m_root, suppress_globals);
 }
 
-void ScopeCollector::analyze_recursive(ScopeRecord& scope)
+void ScopeCollector::analyze_recursive(ScopeRecord& scope, bool suppress_globals)
 {
     // Process children first (bottom-up).
     for (auto& child : scope.children)
-        analyze_recursive(*child);
+        analyze_recursive(*child, suppress_globals);
 
     if (!scope.ast_node)
         return;
 
     propagate_eval_poisoning(scope);
-    resolve_identifiers(scope, m_parser.m_state.initiated_by_eval);
+    resolve_identifiers(scope, m_parser.m_state.initiated_by_eval, suppress_globals);
     hoist_functions(scope);
 
     if (scope.type == ScopeRecord::ScopeType::Function && scope.function_parameters)
@@ -362,11 +399,21 @@ void ScopeCollector::propagate_eval_poisoning(ScopeRecord& scope)
     }
 }
 
-void ScopeCollector::resolve_identifiers(ScopeRecord& scope, bool initiated_by_eval)
+void ScopeCollector::resolve_identifiers(ScopeRecord& scope, bool initiated_by_eval, bool suppress_globals)
 {
-    for (auto& it : scope.identifier_groups) {
-        auto const& identifier_group_name = it.key;
-        auto& identifier_group = it.value;
+    // NB: ScopeRecord::identifier_groups is a HashMap, so its iteration order
+    // is non-deterministic. We sort the keys alphabetically here to ensure
+    // that local variable indices are assigned in a deterministic order.
+    // Without this, the generated bytecode could vary between runs depending
+    // on HashMap bucketing, making it impossible to compare outputs from
+    // different compilation pipelines (e.g. C++ vs Rust).
+    Vector<Utf16FlyString> sorted_keys;
+    for (auto& it : scope.identifier_groups)
+        sorted_keys.append(it.key);
+    quick_sort(sorted_keys, [](auto const& a, auto const& b) { return a.view() < b.view(); });
+
+    for (auto const& identifier_group_name : sorted_keys) {
+        auto& identifier_group = scope.identifier_groups.get(identifier_group_name).value();
 
         if (identifier_group.declaration_kind.has_value()) {
             for (auto& identifier : identifier_group.identifiers) {
@@ -392,6 +439,22 @@ void ScopeCollector::resolve_identifiers(ScopeRecord& scope, bool initiated_by_e
 
         if (scope.type == ScopeRecord::ScopeType::Catch && (var_flags & ScopeVariable::IsCatchParameter)) {
             local_variable_declaration_kind = LocalVariable::DeclarationKind::CatchClauseParameter;
+        }
+
+        // When a function has parameter expressions (default values, etc.), body
+        // var declarations live in a separate Variable Environment from the
+        // parameter scope. If the same name is also referenced in a default
+        // parameter expression, it must not be a local: the default expression
+        // needs to resolve it from the outer scope via the environment chain,
+        // not read the (uninitialized) local.
+        // We also mark the name as captured in the parent scope, so that the
+        // outer binding is not optimized to a local register either.
+        if ((var_flags & ScopeVariable::IsReferencedInFormalParameters)
+            && (var_flags & ScopeVariable::IsVar)
+            && !(var_flags & ScopeVariable::IsForbiddenLexical)) {
+            if (scope.parent)
+                scope.parent->identifier_groups.ensure(identifier_group_name).captured_by_nested_function = true;
+            continue;
         }
 
         bool hoistable_function_declaration = scope.functions_to_hoist.contains([&](auto const& function_declaration) {
@@ -429,7 +492,7 @@ void ScopeCollector::resolve_identifiers(ScopeRecord& scope, bool initiated_by_e
         }
 
         if (scope.type == ScopeRecord::ScopeType::Program) {
-            auto can_use_global_for_identifier = !(identifier_group.used_inside_with_statement || initiated_by_eval);
+            auto can_use_global_for_identifier = !(suppress_globals || identifier_group.used_inside_with_statement || initiated_by_eval);
             if (can_use_global_for_identifier) {
                 for (auto& identifier : identifier_group.identifiers) {
                     if (!identifier->is_inside_scope_with_eval())
@@ -439,6 +502,18 @@ void ScopeCollector::resolve_identifiers(ScopeRecord& scope, bool initiated_by_e
         } else if (local_variable_declaration_kind.has_value() || is_function_parameter) {
             if (hoistable_function_declaration)
                 continue;
+
+            // When a function has parameter expressions and a nested function in a
+            // default expression captures a name that is also a body var, propagate
+            // the capture to the parent scope so the outer binding stays in the
+            // environment (not optimized to a local register).
+            if (scope.has_parameter_expressions
+                && identifier_group.captured_by_nested_function
+                && (var_flags & ScopeVariable::IsVar)
+                && !(var_flags & ScopeVariable::IsForbiddenLexical)
+                && scope.parent) {
+                scope.parent->identifier_groups.ensure(identifier_group_name).captured_by_nested_function = true;
+            }
 
             if (!identifier_group.captured_by_nested_function && !identifier_group.used_inside_with_statement) {
                 if (scope.screwed_by_eval_in_scope_chain)
@@ -556,6 +631,22 @@ void ScopeCollector::build_function_scope_data(ScopeRecord& scope)
                 data->non_local_var_count++;
         }
     }
+
+    // NB: ScopeRecord::variables is a HashMap, so vars_to_initialize was
+    // populated in non-deterministic order. Sort by name to ensure the
+    // function declaration instantiation (FDI) bytecode is deterministic.
+    Vector<size_t> indices;
+    indices.ensure_capacity(data->vars_to_initialize.size());
+    for (size_t i = 0; i < data->vars_to_initialize.size(); ++i)
+        indices.append(i);
+    quick_sort(indices, [&](auto a, auto b) {
+        return data->vars_to_initialize[a].identifier.string() < data->vars_to_initialize[b].identifier.string();
+    });
+    Vector<VarToInitialize> sorted;
+    sorted.ensure_capacity(indices.size());
+    for (auto i : indices)
+        sorted.append(data->vars_to_initialize[i]);
+    data->vars_to_initialize = move(sorted);
 
     scope.ast_node->set_function_scope_data(move(data));
 }

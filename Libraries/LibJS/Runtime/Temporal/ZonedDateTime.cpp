@@ -38,7 +38,7 @@ void ZonedDateTime::visit_edges(Cell::Visitor& visitor)
 }
 
 // 6.5.1 InterpretISODateTimeOffset ( isoDate, time, offsetBehaviour, offsetNanoseconds, timeZone, disambiguation, offsetOption, matchBehaviour ), https://tc39.es/proposal-temporal/#sec-temporal-interpretisodatetimeoffset
-ThrowCompletionOr<Crypto::SignedBigInteger> interpret_iso_date_time_offset(VM& vm, ISODate iso_date, Variant<ParsedISODateTime::StartOfDay, Time> const& time_or_start_of_day, OffsetBehavior offset_behavior, double offset_nanoseconds, StringView time_zone, Disambiguation disambiguation, OffsetOption offset_option, MatchBehavior match_behavior)
+ThrowCompletionOr<Crypto::SignedBigInteger> interpret_iso_date_time_offset(VM& vm, ISODate iso_date, Variant<ParsedISODateTime::StartOfDay, Time> const& time_or_start_of_day, OffsetBehavior offset_behavior, double offset_nanoseconds, String const& time_zone, Disambiguation disambiguation, OffsetOption offset_option, MatchBehavior match_behavior)
 {
     // 1. If time is START-OF-DAY, then
     if (time_or_start_of_day.has<ParsedISODateTime::StartOfDay>()) {
@@ -147,13 +147,9 @@ ThrowCompletionOr<GC::Ref<ZonedDateTime>> to_temporal_zoned_date_time(VM& vm, Va
     Variant<ParsedISODateTime::StartOfDay, Time> time { Time {} };
 
     // 4. If item is an Object, then
-    if (item.is_object()) {
-        auto const& object = item.as_object();
-
+    if (auto object = item.as_if<Object>()) {
         // a. If item has an [[InitializedTemporalZonedDateTime]] internal slot, then
-        if (is<ZonedDateTime>(object)) {
-            auto const& zoned_date_time = static_cast<ZonedDateTime const&>(object);
-
+        if (auto const* zoned_date_time = as_if<ZonedDateTime>(*object)) {
             // i. NOTE: The following steps, and similar ones below, read options and perform independent validation in
             //    alphabetical order (GetTemporalDisambiguationOption reads "disambiguation", GetTemporalOffsetOption
             //    reads "offset", and GetTemporalOverflowOption reads "overflow").
@@ -171,17 +167,17 @@ ThrowCompletionOr<GC::Ref<ZonedDateTime>> to_temporal_zoned_date_time(VM& vm, Va
             TRY(get_temporal_overflow_option(vm, resolved_options));
 
             // vi. Return ! CreateTemporalZonedDateTime(item.[[EpochNanoseconds]], item.[[TimeZone]], item.[[Calendar]]).
-            return MUST(create_temporal_zoned_date_time(vm, zoned_date_time.epoch_nanoseconds(), zoned_date_time.time_zone(), zoned_date_time.calendar()));
+            return MUST(create_temporal_zoned_date_time(vm, zoned_date_time->epoch_nanoseconds(), zoned_date_time->time_zone(), zoned_date_time->calendar()));
         }
 
         // b. Let calendar be ? GetTemporalCalendarIdentifierWithISODefault(item).
-        calendar = TRY(get_temporal_calendar_identifier_with_iso_default(vm, object));
+        calendar = TRY(get_temporal_calendar_identifier_with_iso_default(vm, *object));
 
         // c. Let fields be ? PrepareCalendarFields(calendar, item, « YEAR, MONTH, MONTH-CODE, DAY », « HOUR, MINUTE, SECOND, MILLISECOND, MICROSECOND, NANOSECOND, OFFSET, TIME-ZONE », « TIME-ZONE »).
         static constexpr auto calendar_field_names = to_array({ CalendarField::Year, CalendarField::Month, CalendarField::MonthCode, CalendarField::Day });
         static constexpr auto non_calendar_field_names = to_array({ CalendarField::Hour, CalendarField::Minute, CalendarField::Second, CalendarField::Millisecond, CalendarField::Microsecond, CalendarField::Nanosecond, CalendarField::Offset, CalendarField::TimeZone });
         static constexpr auto required_field_names = to_array({ CalendarField::TimeZone });
-        auto fields = TRY(prepare_calendar_fields(vm, calendar, object, calendar_field_names, non_calendar_field_names, required_field_names.span()));
+        auto fields = TRY(prepare_calendar_fields(vm, calendar, *object, calendar_field_names, non_calendar_field_names, required_field_names.span()));
 
         // d. Let timeZone be fields.[[TimeZone]].
         time_zone = fields.time_zone.release_value();
@@ -393,7 +389,7 @@ String temporal_zoned_date_time_to_string(ZonedDateTime const& zoned_date_time, 
 }
 
 // 6.5.5 AddZonedDateTime ( epochNanoseconds, timeZone, calendar, duration, overflow ), https://tc39.es/proposal-temporal/#sec-temporal-addzoneddatetime
-ThrowCompletionOr<Crypto::SignedBigInteger> add_zoned_date_time(VM& vm, Crypto::SignedBigInteger const& epoch_nanoseconds, StringView time_zone, StringView calendar, InternalDuration const& duration, Overflow overflow)
+ThrowCompletionOr<Crypto::SignedBigInteger> add_zoned_date_time(VM& vm, Crypto::SignedBigInteger const& epoch_nanoseconds, String const& time_zone, StringView calendar, InternalDuration const& duration, Overflow overflow)
 {
     // 1. If DateDurationSign(duration.[[Date]]) = 0, return ? AddInstant(epochNanoseconds, duration.[[Time]]).
     if (date_duration_sign(duration.date) == 0)
@@ -420,7 +416,7 @@ ThrowCompletionOr<Crypto::SignedBigInteger> add_zoned_date_time(VM& vm, Crypto::
 }
 
 // 6.5.6 DifferenceZonedDateTime ( ns1, ns2, timeZone, calendar, largestUnit ), https://tc39.es/proposal-temporal/#sec-temporal-differencezoneddatetime
-ThrowCompletionOr<InternalDuration> difference_zoned_date_time(VM& vm, Crypto::SignedBigInteger const& nanoseconds1, Crypto::SignedBigInteger const& nanoseconds2, StringView time_zone, StringView calendar, Unit largest_unit)
+ThrowCompletionOr<InternalDuration> difference_zoned_date_time(VM& vm, Crypto::SignedBigInteger const& nanoseconds1, Crypto::SignedBigInteger const& nanoseconds2, String const& time_zone, StringView calendar, Unit largest_unit)
 {
     // 1. If ns1 = ns2, return CombineDateAndTimeDuration(ZeroDateDuration(), 0).
     if (nanoseconds1 == nanoseconds2)
@@ -503,7 +499,7 @@ ThrowCompletionOr<InternalDuration> difference_zoned_date_time(VM& vm, Crypto::S
 }
 
 // 6.5.7 DifferenceZonedDateTimeWithRounding ( ns1, ns2, timeZone, calendar, largestUnit, roundingIncrement, smallestUnit, roundingMode ), https://tc39.es/proposal-temporal/#sec-temporal-differencezoneddatetimewithrounding
-ThrowCompletionOr<InternalDuration> difference_zoned_date_time_with_rounding(VM& vm, Crypto::SignedBigInteger const& nanoseconds1, Crypto::SignedBigInteger const& nanoseconds2, StringView time_zone, StringView calendar, Unit largest_unit, u64 rounding_increment, Unit smallest_unit, RoundingMode rounding_mode)
+ThrowCompletionOr<InternalDuration> difference_zoned_date_time_with_rounding(VM& vm, Crypto::SignedBigInteger const& nanoseconds1, Crypto::SignedBigInteger const& nanoseconds2, String const& time_zone, StringView calendar, Unit largest_unit, u64 rounding_increment, Unit smallest_unit, RoundingMode rounding_mode)
 {
     // 1. If TemporalUnitCategory(largestUnit) is TIME, return DifferenceInstant(ns1, ns2, roundingIncrement, smallestUnit, roundingMode).
     if (temporal_unit_category(largest_unit) == UnitCategory::Time)
@@ -524,7 +520,7 @@ ThrowCompletionOr<InternalDuration> difference_zoned_date_time_with_rounding(VM&
 }
 
 // 6.5.8 DifferenceZonedDateTimeWithTotal ( ns1, ns2, timeZone, calendar, unit ), https://tc39.es/proposal-temporal/#sec-temporal-differencezoneddatetimewithtotal
-ThrowCompletionOr<Crypto::BigFraction> difference_zoned_date_time_with_total(VM& vm, Crypto::SignedBigInteger const& nanoseconds1, Crypto::SignedBigInteger const& nanoseconds2, StringView time_zone, StringView calendar, Unit unit)
+ThrowCompletionOr<Crypto::BigFraction> difference_zoned_date_time_with_total(VM& vm, Crypto::SignedBigInteger const& nanoseconds1, Crypto::SignedBigInteger const& nanoseconds2, String const& time_zone, StringView calendar, Unit unit)
 {
     // 1. If TemporalUnitCategory(unit) is TIME, then
     if (temporal_unit_category(unit) == UnitCategory::Time) {

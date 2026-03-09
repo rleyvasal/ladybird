@@ -45,9 +45,12 @@ class DevicePixelConverter;
 class DisplayList;
 class DisplayListPlayerSkia;
 class DisplayListRecorder;
+class ExternalContentSource;
 class SVGGradientPaintStyle;
+class SVGPaintServerPaintStyle;
+class SVGPatternPaintStyle;
 class ScrollStateSnapshot;
-using PaintStyle = RefPtr<SVGGradientPaintStyle>;
+using PaintStyle = RefPtr<SVGPaintServerPaintStyle>;
 using PaintStyleOrColor = Variant<PaintStyle, Gfx::Color>;
 using ScrollStateSnapshotByDisplayList = HashMap<NonnullRefPtr<DisplayList>, ScrollStateSnapshot>;
 
@@ -199,6 +202,15 @@ class SubtleCrypto;
 
 }
 
+namespace Web::CSS::FilterOperation {
+
+struct Blur;
+struct DropShadow;
+struct HueRotate;
+struct Color;
+
+}
+
 namespace Web::CSS {
 
 class AbstractImageStyleValue;
@@ -227,6 +239,7 @@ class ComputedProperties;
 class ConicGradientStyleValue;
 class ContentStyleValue;
 class CounterDefinitionsStyleValue;
+class CounterStyle;
 class CounterStyleStyleValue;
 class CounterStyleSystemStyleValue;
 class CounterStyleValue;
@@ -237,6 +250,8 @@ class CSSCounterStyleRule;
 class CSSDescriptors;
 class CSSFontFaceDescriptors;
 class CSSFontFaceRule;
+class CSSFontFeatureValuesMap;
+class CSSFontFeatureValuesRule;
 class CSSGroupingRule;
 class CSSImageValue;
 class CSSImportRule;
@@ -301,6 +316,7 @@ class FontFace;
 class FontFaceSet;
 class FontSourceStyleValue;
 class FontStyleStyleValue;
+class FontVariantAlternatesFunctionStyleValue;
 class Frequency;
 class FrequencyOrCalculated;
 class FrequencyPercentage;
@@ -391,6 +407,7 @@ class TimePercentage;
 class TimeStyleValue;
 class TransformationStyleValue;
 class TreeCountingFunctionStyleValue;
+class TupleStyleValue;
 class UnicodeRangeStyleValue;
 class UnresolvedStyleValue;
 class URL;
@@ -398,13 +415,64 @@ class URLStyleValue;
 class ViewFunctionStyleValue;
 class VisualViewport;
 
+enum class FontFeatureValueType : u8;
 enum class Keyword : u16;
 enum class MediaFeatureID : u8;
 enum class PropertyID : u16;
-enum class PaintOrder : u8;
 enum class ValueType : u8;
 enum class AnimatedPropertyResultOfTransition : u8;
+
+enum class AbsoluteSize : u8;
+enum class AnchorSize : u8;
+enum class AnimationComposition : u8;
+enum class AnimationDirection : u8;
+enum class AnimationFillMode : u8;
 enum class AnimationPlayState : u8;
+enum class Axis : u8;
+enum class CommonLigValue : u8;
+enum class ContextualAltValue : u8;
+enum class CounterStyleSystem : u8;
+enum class CrossOriginModifierValue : u8;
+enum class Direction : u8;
+enum class DiscretionaryLigValue : u8;
+enum class DisplayBox : u8;
+enum class DisplayInside : u8;
+enum class DisplayInternal : u8;
+enum class DisplayOutside : u8;
+enum class EastAsianVariant : u8;
+enum class EastAsianWidth : u8;
+enum class FontDisplay : u8;
+enum class FontKerning : u8;
+enum class FontOpticalSizing : u8;
+enum class FontStyleKeyword : u8;
+enum class FontTech : u8;
+enum class FontVariantCaps : u8;
+enum class FontVariantEmoji : u8;
+enum class FontVariantPosition : u8;
+enum class HistoricalLigValue : u8;
+enum class HueInterpolationMethod : u8;
+enum class ImageRendering : u8;
+enum class MixBlendMode : u8;
+enum class NumericFigureValue : u8;
+enum class NumericSpacingValue : u8;
+enum class NumericFractionValue : u8;
+enum class PaintOrder : u8;
+enum class PositionEdge : u8;
+enum class RadialExtent : u8;
+enum class ReferrerPolicyModifierValue : u8;
+enum class RelativeSize : u8;
+enum class Repetition : u8;
+enum class RoundingStrategy : u8;
+enum class Scroller : u8;
+enum class StepPosition : u8;
+enum class StrokeLinecap : u8;
+enum class StrokeLinejoin : u8;
+enum class SymbolsType : u8;
+enum class TextRendering : u8;
+enum class TextUnderlinePositionHorizontal : u8;
+enum class TextUnderlinePositionVertical : u8;
+enum class TransitionBehavior : u8;
+enum class WritingMode : u8;
 
 struct BackgroundLayerData;
 struct CalculationContext;
@@ -416,13 +484,14 @@ struct RandomCachingKey;
 struct RequiredInvalidationAfterStyleChange;
 struct StyleSheetIdentifier;
 struct TransitionProperties;
-template<typename T>
-struct ValueComparingNonnullRefPtr;
 
 // https://drafts.css-houdini.org/css-typed-om-1/#typedefdef-cssnumberish
 using CSSNumberish = Variant<double, GC::Root<CSSNumericValue>>;
 using PaintOrderList = Array<PaintOrder, 3>;
 using StyleValueVector = Vector<ValueComparingNonnullRefPtr<StyleValue const>>;
+using StyleValueTuple = Vector<ValueComparingRefPtr<StyleValue const>>;
+
+using FilterValue = Variant<FilterOperation::Blur, FilterOperation::DropShadow, FilterOperation::HueRotate, FilterOperation::Color, URL>;
 
 }
 
@@ -795,7 +864,6 @@ class WorkerNavigator;
 class XMLSerializer;
 
 enum class AllowMultipleFiles;
-enum class MediaSeekMode;
 enum class RequireWellFormed;
 enum class SandboxingFlagSet;
 
@@ -834,7 +902,6 @@ class Database;
 class IDBCursor;
 class IDBCursorWithValue;
 class IDBDatabase;
-class IDBDatabaseObserver;
 class IDBFactory;
 class IDBIndex;
 class IDBKeyRange;
@@ -842,9 +909,7 @@ class IDBObjectStore;
 class IDBOpenDBRequest;
 class IDBRecord;
 class IDBRequest;
-class IDBRequestObserver;
 class IDBTransaction;
-class IDBTransactionObserver;
 class IDBVersionChangeEvent;
 class Index;
 class ObjectStore;
@@ -1150,6 +1215,7 @@ class SVGFEBlendElement;
 class SVGFEColorMatrixElement;
 class SVGFEComponentTransferElement;
 class SVGFECompositeElement;
+class SVGFEDisplacementMapElement;
 class SVGFEFloodElement;
 class SVGFEFuncAElement;
 class SVGFEFuncBElement;
@@ -1173,6 +1239,7 @@ class SVGMetadataElement;
 class SVGNumber;
 class SVGNumberList;
 class SVGPathElement;
+class SVGPatternElement;
 class SVGPolygonElement;
 class SVGPolylineElement;
 class SVGRectElement;

@@ -15,6 +15,7 @@
 #include <LibWeb/Layout/GridFormattingContext.h>
 #include <LibWeb/Layout/InlineNode.h>
 #include <LibWeb/Layout/ReplacedBox.h>
+#include <LibWeb/Layout/ReplacedWithChildrenFormattingContext.h>
 #include <LibWeb/Layout/SVGFormattingContext.h>
 #include <LibWeb/Layout/SVGSVGBox.h>
 #include <LibWeb/Layout/TableFormattingContext.h>
@@ -139,15 +140,17 @@ bool FormattingContext::creates_block_formatting_context(Box const& box)
 
 Optional<FormattingContext::Type> FormattingContext::formatting_context_type_created_by_box(Box const& box)
 {
-    if (box.is_replaced_box() && !box.can_have_children()) {
+    if (is<SVGSVGBox>(box))
+        return Type::SVG;
+
+    if (box.is_replaced_box_with_children())
+        return Type::ReplacedWithChildren;
+
+    if (box.is_replaced_box())
         return Type::InternalReplaced;
-    }
 
     if (!box.can_have_children())
         return {};
-
-    if (is<SVGSVGBox>(box))
-        return Type::SVG;
 
     auto display = box.display();
 
@@ -222,6 +225,8 @@ OwnPtr<FormattingContext> FormattingContext::create_independent_formatting_conte
         return make<GridFormattingContext>(state, layout_mode, child_box, this);
     case Type::Table:
         return make<TableFormattingContext>(state, layout_mode, child_box, this);
+    case Type::ReplacedWithChildren:
+        return make<ReplacedWithChildrenFormattingContext>(state, layout_mode, child_box, this);
     case Type::InternalReplaced:
         return make<ReplacedFormattingContext>(state, layout_mode, child_box);
     case Type::InternalDummy:
@@ -307,9 +312,12 @@ CSSPixelSize FormattingContext::solve_replaced_size_constraint(CSSPixels input_w
     // https://www.w3.org/TR/CSS22/visudet.html#min-max-widths
 
     auto const& containing_block = *box.non_anonymous_containing_block();
-    auto const& containing_block_state = m_state.get(containing_block);
-    auto width_of_containing_block = containing_block_state.content_width();
-    auto height_of_containing_block = containing_block_state.content_height();
+    CSSPixels width_of_containing_block = 0;
+    CSSPixels height_of_containing_block = 0;
+    if (auto const* containing_block_used_values = m_state.try_get(containing_block)) {
+        width_of_containing_block = containing_block_used_values->content_width();
+        height_of_containing_block = containing_block_used_values->content_height();
+    }
 
     auto min_width = box.computed_values().min_width().is_auto() ? 0 : box.computed_values().min_width().to_px(box, width_of_containing_block);
     auto specified_max_width = should_treat_max_width_as_none(box, available_space.width) ? input_width : box.computed_values().max_width().to_px(box, width_of_containing_block);
@@ -453,7 +461,8 @@ CSSPixels FormattingContext::compute_table_box_width_inside_table_wrapper(Box co
     });
     VERIFY(table_box.has_value());
 
-    LayoutState throwaway_state;
+    LayoutState throwaway_state(box);
+    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto& table_box_state = throwaway_state.get_mutable(*table_box);
     auto const& table_box_computed_values = table_box->computed_values();
@@ -487,7 +496,8 @@ CSSPixels FormattingContext::compute_table_box_height_inside_table_wrapper(Box c
     // table-wrapper can't have borders or paddings but it might have margin taken from table-root.
     auto available_height = height_of_containing_block - margin_top - margin_bottom;
 
-    LayoutState throwaway_state;
+    LayoutState throwaway_state(box);
+    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto context = create_independent_formatting_context_if_needed(throwaway_state, LayoutMode::IntrinsicSizing, box);
     VERIFY(context);
@@ -653,7 +663,9 @@ CSSPixels FormattingContext::compute_height_for_replaced_element(Box const& box,
     // 10.6.6 Floating replaced elements
     // 10.6.10 'inline-block' replaced elements in normal flow
 
-    auto height_of_containing_block = m_state.get(*box.non_anonymous_containing_block()).content_height();
+    CSSPixels height_of_containing_block = 0;
+    if (auto const* containing_block_used_values = m_state.try_get(*box.non_anonymous_containing_block()))
+        height_of_containing_block = containing_block_used_values->content_height();
     auto computed_width = should_treat_width_as_auto(box, available_space) ? CSS::Size::make_auto() : box.computed_values().width();
     auto computed_height = should_treat_height_as_auto(box, available_space) ? CSS::Size::make_auto() : box.computed_values().height();
 
@@ -874,6 +886,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_ele
     box_state.margin_right = margin_right.to_px_or_zero(box);
 }
 
+// https://drafts.csswg.org/css2/#abs-replaced-width
 void FormattingContext::compute_width_for_absolutely_positioned_replaced_element(Box const& box, AvailableSpace const& available_space)
 {
     // 10.3.8 Absolutely positioned, replaced elements
@@ -884,8 +897,13 @@ void FormattingContext::compute_width_for_absolutely_positioned_replaced_element
 
     auto width = compute_width_for_replaced_element(box, available_space);
     auto width_of_containing_block = available_space.width.to_px_or_zero();
-    auto available = width_of_containing_block - width;
     auto const& computed_values = box.computed_values();
+    auto& box_state = m_state.get_mutable(box);
+    auto const border_left = computed_values.border_left().width;
+    auto const border_right = computed_values.border_right().width;
+    auto const padding_left = box_state.padding_left;
+    auto const padding_right = box_state.padding_right;
+    auto available = width_of_containing_block - width - border_left - padding_left - padding_right - border_right;
     auto left = computed_values.inset().left();
     auto margin_left = computed_values.margin().left();
     auto right = computed_values.inset().right();
@@ -945,7 +963,6 @@ void FormattingContext::compute_width_for_absolutely_positioned_replaced_element
         right = CSS::Length::make_px(available - to_px(left) - to_px(margin_left) - to_px(margin_right));
     }
 
-    auto& box_state = m_state.get_mutable(box);
     box_state.inset_left = to_px(left);
     box_state.inset_right = to_px(right);
     box_state.margin_left = to_px(margin_left);
@@ -1248,7 +1265,7 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
     if (!block_container)
         return {};
 
-    auto const* block_container_used_values = state.used_values_per_layout_node.get(*block_container).value_or(nullptr);
+    auto const* block_container_used_values = state.try_get(*block_container);
     if (!block_container_used_values)
         return {};
 
@@ -1285,7 +1302,7 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
 
     // Expand the bounding rect by the inline's padding to get the padding box.
     // Per CSS, the containing block is formed by the padding edge.
-    auto const* inline_used_values = state.used_values_per_layout_node.get(inline_node).value_or(nullptr);
+    auto const* inline_used_values = state.try_get(inline_node);
     if (inline_used_values) {
         bounding_rect->set_x(bounding_rect->x() - inline_used_values->padding_left);
         bounding_rect->set_y(bounding_rect->y() - inline_used_values->padding_top);
@@ -1298,7 +1315,7 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
     // Walk from block_container up to abspos_containing_block, accumulating offsets.
     CSSPixelPoint offset_to_containing_block;
     for (Node const* ancestor = block_container; ancestor && ancestor != &abspos_containing_block; ancestor = ancestor->parent()) {
-        if (auto const* ancestor_used_values = state.used_values_per_layout_node.get(*ancestor).value_or(nullptr)) {
+        if (auto const* ancestor_used_values = state.try_get(*ancestor)) {
             offset_to_containing_block.translate_by(ancestor_used_values->offset);
         }
     }
@@ -1353,8 +1370,8 @@ void FormattingContext::layout_absolutely_positioned_children()
 void FormattingContext::layout_absolutely_positioned_element(Box const& box, AbsposContainingBlockInfo const& containing_block_info)
 {
     if (box.is_svg_box()) {
-        dbgln("FIXME: Implement support for absolutely positioned SVG elements.");
-        return;
+        // SVG elements cannot be absolutely positioned.
+        VERIFY_NOT_REACHED();
     }
 
     auto const available_space = AvailableSpace(AvailableSize::make_definite(containing_block_info.rect.width()), AvailableSize::make_definite(containing_block_info.rect.height()));
@@ -1499,8 +1516,13 @@ void FormattingContext::compute_height_for_absolutely_positioned_replaced_elemen
     auto height = compute_height_for_replaced_element(box, available_space);
 
     auto height_of_containing_block = available_space.height.to_px_or_zero();
-    auto available = height_of_containing_block - height;
     auto const& computed_values = box.computed_values();
+    auto& box_state = m_state.get_mutable(box);
+    auto const border_top = computed_values.border_top().width;
+    auto const border_bottom = computed_values.border_bottom().width;
+    auto const padding_top = box_state.padding_top;
+    auto const padding_bottom = box_state.padding_bottom;
+    auto available = height_of_containing_block - height - border_top - padding_top - padding_bottom - border_bottom;
     auto top = computed_values.inset().top();
     auto margin_top = computed_values.margin().top();
     auto bottom = computed_values.inset().bottom();
@@ -1549,7 +1571,6 @@ void FormattingContext::compute_height_for_absolutely_positioned_replaced_elemen
         bottom = CSS::Length::make_px(available - to_px(top) - to_px(margin_top) - to_px(margin_bottom));
     }
 
-    auto& box_state = m_state.get_mutable(box);
     box_state.set_content_height(height);
 
     // do not set calculated insets or margins on the first pass, there will be a second pass
@@ -1667,7 +1688,8 @@ CSSPixels FormattingContext::calculate_min_content_width(Layout::Box const& box)
     if (cache.has_value())
         return cache.value();
 
-    LayoutState throwaway_state;
+    LayoutState throwaway_state(box);
+    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto& box_state = throwaway_state.get_mutable(box);
     box_state.width_constraint = SizeConstraint::MinContent;
@@ -1701,7 +1723,8 @@ CSSPixels FormattingContext::calculate_max_content_width(Layout::Box const& box)
     if (cache.has_value())
         return cache.value();
 
-    LayoutState throwaway_state;
+    LayoutState throwaway_state(box);
+    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto const& actual_box_state = m_state.get(box);
 
@@ -1750,7 +1773,8 @@ CSSPixels FormattingContext::calculate_min_content_height(Layout::Box const& box
     if (cache.has_value())
         return cache.value();
 
-    LayoutState throwaway_state;
+    LayoutState throwaway_state(box);
+    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto& box_state = throwaway_state.get_mutable(box);
     box_state.height_constraint = SizeConstraint::MinContent;
@@ -1782,7 +1806,8 @@ CSSPixels FormattingContext::calculate_max_content_height(Layout::Box const& box
     if (cache_slot.has_value())
         return cache_slot.value();
 
-    LayoutState throwaway_state;
+    LayoutState throwaway_state(box);
+    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto& box_state = throwaway_state.get_mutable(box);
     box_state.height_constraint = SizeConstraint::MaxContent;
@@ -1872,8 +1897,10 @@ CSSPixels FormattingContext::calculate_inner_height(Box const& box, AvailableSpa
                 containing_block = containing_block->containing_block();
         }
 
-        if (containing_block && m_state.get(*containing_block).has_definite_height())
-            height_of_containing_block = m_state.get(*containing_block).content_height();
+        if (auto const* containing_block_used_values = containing_block ? m_state.try_get(*containing_block) : nullptr) {
+            if (containing_block_used_values->has_definite_height())
+                height_of_containing_block = containing_block_used_values->content_height();
+        }
     }
     auto& computed_values = box.computed_values();
 
@@ -2014,7 +2041,12 @@ bool FormattingContext::should_treat_height_as_auto(Box const& box, AvailableSpa
                 auto containing_block = box.containing_block();
                 while (containing_block && containing_block->is_anonymous())
                     containing_block = containing_block->containing_block();
-                if (containing_block && !m_state.get(*containing_block).has_definite_height())
+                if (!containing_block)
+                    return true;
+                auto const* containing_block_used_values = m_state.try_get(*containing_block);
+                if (!containing_block_used_values)
+                    return true;
+                if (!containing_block_used_values->has_definite_height())
                     return true;
             }
         }
@@ -2199,7 +2231,7 @@ bool FormattingContext::box_is_sized_as_replaced_element(Box const& box, Availab
     // replaced element with a natural aspect ratio and no natural size in that axis, see e.g. CSS2 §10
     // and CSS Flexible Box Model Level 1 §9.2.
     // https://www.w3.org/TR/css-sizing-4/#aspect-ratio-automatic
-    if (is<ReplacedBox>(box))
+    if (box.is_replaced_box() && box.has_auto_content_box_size())
         return true;
 
     if (box.has_preferred_aspect_ratio() || box.has_auto_content_box_size()) {
@@ -2241,7 +2273,10 @@ bool FormattingContext::should_treat_max_width_as_none(Box const& box, Available
                 return true;
             return false;
         }
-        if (!m_state.get(*box.non_anonymous_containing_block()).has_definite_width())
+        auto const* containing_block_used_values = m_state.try_get(*box.non_anonymous_containing_block());
+        if (!containing_block_used_values)
+            return true;
+        if (!containing_block_used_values->has_definite_width())
             return true;
     }
     if (max_width.is_fit_content() && available_width.is_intrinsic_sizing_constraint())
@@ -2265,7 +2300,10 @@ bool FormattingContext::should_treat_max_height_as_none(Box const& box, Availabl
     if (max_height.contains_percentage()) {
         if (available_height.is_min_content())
             return false;
-        if (!m_state.get(*box.non_anonymous_containing_block()).has_definite_height())
+        auto const* containing_block_used_values = m_state.try_get(*box.non_anonymous_containing_block());
+        if (!containing_block_used_values)
+            return true;
+        if (!containing_block_used_values->has_definite_height())
             return true;
     }
     if (max_height.is_fit_content() && available_height.is_intrinsic_sizing_constraint())

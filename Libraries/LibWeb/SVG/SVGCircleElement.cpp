@@ -7,6 +7,7 @@
 #include <LibGfx/Path.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/SVGCircleElementPrototype.h>
+#include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/Layout/Node.h>
@@ -62,12 +63,13 @@ static CSSPixels normalized_diagonal_length(CSSPixelSize viewport_size)
 {
     if (viewport_size.width() == viewport_size.height())
         return viewport_size.width();
-    return sqrt((viewport_size.width() * viewport_size.width()) + (viewport_size.height() * viewport_size.height())) / CSSPixels::nearest_value_for(AK::Sqrt2<float>);
+    return sqrt(((viewport_size.width() * viewport_size.width()) + (viewport_size.height() * viewport_size.height())) / 2);
 }
 
 Gfx::Path SVGCircleElement::get_path(CSSPixelSize viewport_size)
 {
-    auto node = layout_node();
+    // NB: Called during SVG layout.
+    auto node = unsafe_layout_node();
     if (!node) {
         dbgln("FIXME: Null layout node in SVGCircleElement::get_path");
         return {};

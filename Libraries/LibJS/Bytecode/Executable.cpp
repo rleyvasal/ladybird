@@ -8,6 +8,7 @@
 #include <LibJS/Bytecode/BasicBlock.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/Instruction.h>
+#include <LibJS/Bytecode/Op.h>
 #include <LibJS/Bytecode/RegexTable.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/SharedFunctionInstanceData.h>
@@ -32,7 +33,8 @@ Executable::Executable(
     size_t number_of_object_shape_caches,
     size_t number_of_registers,
     Strict strict)
-    : bytecode(move(bytecode))
+    : GC::WeakContainer(heap())
+    , bytecode(move(bytecode))
     , string_table(move(string_table))
     , identifier_table(move(identifier_table))
     , property_key_table(move(property_key_table))
@@ -49,6 +51,18 @@ Executable::Executable(
 }
 
 Executable::~Executable() = default;
+
+void Executable::fixup_cache_pointers()
+{
+    for (auto it = InstructionStreamIterator(bytecode); !it.at_end(); ++it) {
+        fixup_instruction_cache(
+            const_cast<Instruction&>(*it),
+            property_lookup_caches.span(),
+            global_variable_caches.span(),
+            template_object_caches.span(),
+            object_shape_caches.span());
+    }
+}
 
 void Executable::dump() const
 {
@@ -92,6 +106,45 @@ void Executable::dump() const
     warnln("");
 }
 
+String Executable::dump_to_string() const
+{
+    StringBuilder output;
+    output.appendff("JS bytecode executable \"{}\"\n", name);
+    InstructionStreamIterator it(bytecode, this);
+
+    size_t basic_block_offset_index = 0;
+
+    while (!it.at_end()) {
+        bool print_basic_block_marker = false;
+        if (basic_block_offset_index < basic_block_start_offsets.size()
+            && it.offset() == basic_block_start_offsets[basic_block_offset_index]) {
+            ++basic_block_offset_index;
+            print_basic_block_marker = true;
+        }
+
+        output.appendff("[{:4x}] ", it.offset());
+        if (print_basic_block_marker)
+            output.appendff("{:4}: ", basic_block_offset_index - 1);
+        else
+            output.append("      "sv);
+        output.appendff("{}\n", (*it).to_byte_string(*this));
+
+        ++it;
+    }
+
+    if (!exception_handlers.is_empty()) {
+        output.append("\nException handlers:\n"sv);
+        for (auto& handlers : exception_handlers) {
+            output.appendff("    from {:4x} to {:4x} handler {:4x}\n",
+                handlers.start_offset,
+                handlers.end_offset,
+                handlers.handler_offset);
+        }
+    }
+
+    return output.to_string_without_validation();
+}
+
 void Executable::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -107,6 +160,53 @@ void Executable::visit_edges(Visitor& visitor)
         }
     }
     property_key_table->visit_edges(visitor);
+}
+
+static Vector<PropertyLookupCache*>& static_property_lookup_caches()
+{
+    static Vector<PropertyLookupCache*> caches;
+    return caches;
+}
+
+StaticPropertyLookupCache::StaticPropertyLookupCache()
+{
+    static_property_lookup_caches().append(this);
+}
+
+static void clear_cache_entry_if_dead(PropertyLookupCache::Entry& entry)
+{
+    if (entry.from_shape && entry.from_shape->state() != Cell::State::Live)
+        entry.from_shape = nullptr;
+    if (entry.shape && entry.shape->state() != Cell::State::Live)
+        entry.shape = nullptr;
+    if (entry.prototype && entry.prototype->state() != Cell::State::Live)
+        entry.prototype = nullptr;
+    if (entry.prototype_chain_validity && entry.prototype_chain_validity->state() != Cell::State::Live)
+        entry.prototype_chain_validity = nullptr;
+}
+
+void StaticPropertyLookupCache::sweep_all()
+{
+    for (auto* cache : static_property_lookup_caches()) {
+        for (auto& entry : cache->entries)
+            clear_cache_entry_if_dead(entry);
+    }
+}
+
+void Executable::remove_dead_cells(Badge<GC::Heap>)
+{
+    for (auto& cache : property_lookup_caches) {
+        for (auto& entry : cache.entries)
+            clear_cache_entry_if_dead(entry);
+    }
+    for (auto& cache : global_variable_caches) {
+        for (auto& entry : cache.entries)
+            clear_cache_entry_if_dead(entry);
+    }
+    for (auto& cache : object_shape_caches) {
+        if (cache.shape && cache.shape->state() != Cell::State::Live)
+            cache.shape = nullptr;
+    }
 }
 
 Optional<Executable::ExceptionHandlers const&> Executable::exception_handlers_for_offset(size_t offset) const

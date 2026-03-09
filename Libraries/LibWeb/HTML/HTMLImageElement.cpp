@@ -6,10 +6,12 @@
  */
 
 #include <LibCore/Timer.h>
+#include <LibGC/Weak.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImmutableBitmap.h>
 #include <LibWeb/ARIA/Roles.h>
 #include <LibWeb/Bindings/HTMLImageElementPrototype.h>
+#include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -176,8 +178,9 @@ void HTMLImageElement::form_associated_element_attribute_changed(FlyString const
     }
 
     if (name == HTML::AttributeNames::alt) {
-        if (layout_node())
-            did_update_alt_text(as<Layout::ImageBox>(*layout_node()));
+        // NB: Called from attribute change handler, layout may be stale.
+        if (unsafe_layout_node())
+            did_update_alt_text(as<Layout::ImageBox>(*unsafe_layout_node()));
     }
 
     if (name == HTML::AttributeNames::decoding) {
@@ -251,7 +254,7 @@ void HTMLImageElement::set_visible_in_viewport(bool)
 // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-width
 WebIDL::UnsignedLong HTMLImageElement::width() const
 {
-    const_cast<DOM::Document&>(document()).update_layout(DOM::UpdateLayoutReason::HTMLImageElementWidth);
+    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementWidth);
 
     // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
     if (auto* paintable_box = this->paintable_box())
@@ -282,7 +285,7 @@ void HTMLImageElement::set_width(WebIDL::UnsignedLong width)
 // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-height
 WebIDL::UnsignedLong HTMLImageElement::height() const
 {
-    const_cast<DOM::Document&>(document()).update_layout(DOM::UpdateLayoutReason::HTMLImageElementHeight);
+    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementHeight);
 
     // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
     if (auto* paintable_box = this->paintable_box())
@@ -340,7 +343,7 @@ int HTMLImageElement::x() const
     // The x attribute, on getting, must return the scaled x-coordinate of the left border edge of the first box
     // associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
     // to the element and its ancestors, or zero if there is no box.
-    const_cast<DOM::Document&>(document()).update_layout(DOM::UpdateLayoutReason::HTMLImageElementX);
+    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementX);
 
     auto const* paintable_box = this->paintable_box();
     if (!paintable_box)
@@ -359,7 +362,7 @@ int HTMLImageElement::y() const
     // The y attribute, on getting, must return the scaled y-coordinate of the top border edge of the first box
     // associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
     // to the element and its ancestors, or zero if there is no box.
-    const_cast<DOM::Document&>(document()).update_layout(DOM::UpdateLayoutReason::HTMLImageElementY);
+    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementY);
 
     auto const* paintable_box = this->paintable_box();
     if (!paintable_box)
@@ -416,85 +419,90 @@ WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> HTMLImageElement::decode() const
         // 1. Let global be this's relevant global object.
         auto& global = relevant_global_object(*this);
 
-        auto reject_if_document_not_fully_active = [this, promise, &realm]() -> bool {
-            if (this->document().is_fully_active())
-                return false;
-
-            auto exception = WebIDL::EncodingError::create(realm, "Node document not fully active"_utf16);
+        auto reject_promise = [promise, &realm](Utf16String const& message) {
+            auto exception = WebIDL::EncodingError::create(realm, message);
             HTML::TemporaryExecutionContext context(realm);
             WebIDL::reject_promise(realm, promise, exception);
-            return true;
         };
 
-        auto reject_if_current_request_state_broken = [this, promise, &realm]() {
-            if (this->current_request().state() != ImageRequest::State::Broken)
-                return false;
+        auto queue_reject_task = [reject_promise, &global, &realm](Utf16String const& message) {
+            queue_global_task(Task::Source::DOMManipulation, global, GC::create_function(realm.heap(), [reject_promise, message = message] {
+                reject_promise(message);
+            }));
+        };
 
-            auto exception = WebIDL::EncodingError::create(realm, "Current request state is broken"_utf16);
-            HTML::TemporaryExecutionContext context(realm);
-            WebIDL::reject_promise(realm, promise, exception);
-            return true;
+        auto queue_resolve_task = [promise, &realm, &global] {
+            queue_global_task(Task::Source::DOMManipulation, global, GC::create_function(realm.heap(), [&realm, promise] {
+                HTML::TemporaryExecutionContext context(realm);
+                WebIDL::resolve_promise(realm, promise, JS::js_undefined());
+            }));
         };
 
         // 2. If any of the following are true:
         //    - this's node document is not fully active;
-        //    - or this's current request's state is broken,
-        //    then reject promise with an "EncodingError" DOMException.
-        if (reject_if_document_not_fully_active() || reject_if_current_request_state_broken()) {
+        if (!document().is_fully_active()) {
+            // then reject promise with an "EncodingError" DOMException.
+            reject_promise("Node document not fully active"_utf16);
             return;
         }
 
+        //    - or this's current request's state is broken,
+        auto& current_request = *m_current_request;
+        if (current_request.state() == ImageRequest::State::Broken) {
+            // then reject promise with an "EncodingError" DOMException.
+            reject_promise("Current request state is broken"_utf16);
+            return;
+        }
+
+        auto expected_request = m_current_request;
+        auto weak_this = GC::Weak<HTMLImageElement> { *this };
+
         // 3. Otherwise, in parallel wait for one of the following cases to occur, and perform the corresponding actions:
-        Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this, promise, &realm, &global] {
-            Platform::EventLoopPlugin::the().spin_until(GC::create_function(heap(), [this, promise, &realm, &global] {
-                auto queue_reject_task = [promise, &realm, &global](Utf16String message) {
-                    queue_global_task(Task::Source::DOMManipulation, global, GC::create_function(realm.heap(), [&realm, promise, message = move(message)] {
-                        auto exception = WebIDL::EncodingError::create(realm, message);
-                        HTML::TemporaryExecutionContext context(realm);
-                        WebIDL::reject_promise(realm, promise, exception);
-                    }));
-                };
+        if (current_request.state() == ImageRequest::State::CompletelyAvailable) {
+            queue_resolve_task();
+            return;
+        }
 
-                // -> This img element's node document stops being fully active
-                if (!document().is_fully_active()) {
-                    // Queue a global task on the DOM manipulation task source with global to reject promise with an "EncodingError" DOMException.
+        current_request.add_callbacks(
+            [weak_this, expected_request, queue_resolve_task, queue_reject_task] {
+                if (!weak_this) {
+                    queue_reject_task("Image element no longer available"_utf16);
+                    return;
+                }
+                auto& image = *weak_this;
+
+                if (!image.document().is_fully_active()) {
                     queue_reject_task("Node document not fully active"_utf16);
-                    return true;
+                    return;
                 }
-
-                auto state = this->current_request().state();
-
-                // -> FIXME: This img element's current request changes or is mutated
-                if (false) {
-                    // Queue a global task on the DOM manipulation task source with global to reject promise with an "EncodingError" DOMException.
+                if (image.m_current_request != expected_request) {
                     queue_reject_task("Current request changed or was mutated"_utf16);
-                    return true;
+                    return;
                 }
-
-                // -> This img element's current request's state becomes broken
-                if (state == ImageRequest::State::Broken) {
-                    // Queue a global task on the DOM manipulation task source with global to reject promise with an "EncodingError" DOMException.
+                if (image.current_request().state() == ImageRequest::State::Broken) {
                     queue_reject_task("Current request state is broken"_utf16);
-                    return true;
+                    return;
+                }
+                queue_resolve_task();
+            },
+            [weak_this, expected_request, queue_reject_task] {
+                if (!weak_this) {
+                    queue_reject_task("Image element no longer available"_utf16);
+                    return;
+                }
+                auto& image = *weak_this;
+
+                if (!image.document().is_fully_active()) {
+                    queue_reject_task("Node document not fully active"_utf16);
+                    return;
                 }
 
-                // -> This img element's current request's state becomes completely available
-                if (state == ImageRequest::State::CompletelyAvailable) {
-                    // FIXME: Decode the image.
-                    // FIXME: If decoding does not need to be performed for this image (for example because it is a vector graphic) or the decoding process completes successfully, then queue a global task on the DOM manipulation task source with global to resolve promise with undefined.
-                    // FIXME: If decoding fails (for example due to invalid image data), then queue a global task on the DOM manipulation task source with global to reject promise with an "EncodingError" DOMException.
-
-                    // NOTE: For now we just resolve it.
-                    queue_global_task(Task::Source::DOMManipulation, global, GC::create_function(realm.heap(), [&realm, promise] {
-                        HTML::TemporaryExecutionContext context(realm);
-                        WebIDL::resolve_promise(realm, promise, JS::js_undefined());
-                    }));
-                    return true;
+                if (image.m_current_request != expected_request) {
+                    queue_reject_task("Current request changed or was mutated"_utf16);
+                    return;
                 }
-
-                return false;
-            }));
-        }));
+                queue_reject_task("Current request state is broken"_utf16);
+            });
     }));
 
     // 3. Return promise.
@@ -656,6 +664,7 @@ void HTMLImageElement::update_the_image_data_impl(bool restart_animations, bool 
             m_current_request = ImageRequest::create(realm(), document().page());
             m_current_request->set_image_data(entry->image_data);
             m_current_request->set_state(ImageRequest::State::CompletelyAvailable);
+            m_current_frame_index = 0;
 
             // 5. Prepare the current request for presentation given the img element.
             m_current_request->prepare_for_presentation(*this);
@@ -829,7 +838,7 @@ after_step_7:
         if (delay_load_event)
             m_load_event_delayer.emplace(document());
 
-        add_callbacks_to_image_request(*image_request, maybe_omit_events, *url_string, previous_url);
+        add_callbacks_to_image_request(*image_request, maybe_omit_events, *url_string, previous_url, update_the_image_data_count);
 
         // AD-HOC: If the image request is already available or fetching, no need to start another fetch.
         if (image_request->is_available() || image_request->is_fetching())
@@ -874,14 +883,21 @@ after_step_7:
     }));
 }
 
-void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> image_request, bool maybe_omit_events, String const& url_string, String const& previous_url)
+void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> image_request, bool maybe_omit_events, String const& url_string, String const& previous_url, u64 update_the_image_data_count)
 {
     image_request->add_callbacks(
-        [this, image_request, maybe_omit_events, url_string, previous_url]() {
-            batching_dispatcher().enqueue(GC::create_function(realm().heap(), [this, image_request, maybe_omit_events, url_string, previous_url] {
+        [this, image_request, maybe_omit_events, url_string, previous_url, update_the_image_data_count]() {
+            batching_dispatcher().enqueue(GC::create_function(realm().heap(), [this, image_request, maybe_omit_events, url_string, previous_url, update_the_image_data_count] {
                 // AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
                 //         between when the fetch completed and when this batched callback runs.
                 if (!document().is_fully_active()) {
+                    m_load_event_delayer.clear();
+                    return;
+                }
+
+                // AD-HOC: If another instance of update_the_image_data was started after the one that initiated this
+                //         request, this callback is stale. Bail out to avoid corrupting the state of the newer request.
+                if (update_the_image_data_count != m_update_the_image_data_count) {
                     m_load_event_delayer.clear();
                     return;
                 }
@@ -911,15 +927,15 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
                 document().list_of_available_images().add(key, *image_data, true);
 
                 set_needs_style_update(true);
-                if (auto layout_node = this->layout_node())
-                    layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
+                set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
 
                 // 4. If maybe omit events is not set or previousURL is not equal to urlString, then fire an event named load at the img element.
                 if (!maybe_omit_events || previous_url != url_string)
                     dispatch_event(DOM::Event::create(realm(), HTML::EventNames::load));
 
+                m_current_frame_index = 0;
+                m_animation_timer->stop();
                 if (image_data->is_animated() && image_data->frame_count() > 1) {
-                    m_current_frame_index = 0;
                     m_animation_timer->set_interval(image_data->frame_duration(0));
                     m_animation_timer->start();
                 }
@@ -927,7 +943,7 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
                 m_load_event_delayer.clear();
             }));
         },
-        [this, image_request, maybe_omit_events, url_string, previous_url]() {
+        [this, image_request, maybe_omit_events, url_string, previous_url, update_the_image_data_count]() {
             // AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
             //         between when the fetch completed and when this failure callback runs.
             if (!document().is_fully_active()) {
@@ -936,6 +952,13 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
             }
 
             // The image data is not in a supported file format;
+
+            // AD-HOC: If another instance of update_the_image_data was started after the one that initiated this
+            //         request, this callback is stale. Bail out to avoid corrupting the state of the newer request.
+            if (update_the_image_data_count != m_update_the_image_data_count) {
+                m_load_event_delayer.clear();
+                return;
+            }
 
             // the user agent must set image request's state to broken,
             image_request->set_state(ImageRequest::State::Broken);
@@ -1060,8 +1083,7 @@ void HTMLImageElement::react_to_changes_in_the_environment()
             image_request->prepare_for_presentation(*this);
             // FIXME: This is ad-hoc, updating the layout here should probably be handled by prepare_for_presentation().
             set_needs_style_update(true);
-            if (auto layout_node = this->layout_node())
-                layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLImageElementReactToChangesInTheEnvironment);
+            set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLImageElementReactToChangesInTheEnvironment);
 
             // 7. Fire an event named load at the img element.
             dispatch_event(DOM::Event::create(realm(), HTML::EventNames::load));
@@ -1370,8 +1392,7 @@ void HTMLImageElement::animate()
         }
     }
 
-    if (paintable())
-        paintable()->set_needs_display();
+    set_needs_repaint();
 }
 
 bool HTMLImageElement::allows_auto_sizes() const

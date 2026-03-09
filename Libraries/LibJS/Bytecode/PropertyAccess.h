@@ -163,8 +163,8 @@ ALWAYS_INLINE ThrowCompletionOr<Value> get_by_id(VM& vm, GetBaseIdentifier get_b
             auto& entry = get_cache_slot();
             entry.shape = &base_obj->shape();
             entry.property_offset = cacheable_metadata.property_offset.value();
-            entry.prototype = *cacheable_metadata.prototype;
-            entry.prototype_chain_validity = *prototype_chain_validity;
+            entry.prototype = const_cast<Object*>(cacheable_metadata.prototype.ptr());
+            entry.prototype_chain_validity = prototype_chain_validity;
 
             if (shape.is_dictionary()) {
                 entry.shape_dictionary_generation = shape.dictionary_generation();
@@ -197,8 +197,7 @@ COLD Completion throw_null_or_undefined_property_access(VM& vm, Value base_value
     return vm.throw_completion<TypeError>(ErrorType::ToObjectNullOrUndefined);
 }
 
-template<PutKind kind>
-ThrowCompletionOr<void> put_by_property_key(VM& vm, Value base, Value this_value, Value value, Optional<Utf16FlyString const&> const base_identifier, PropertyKey const& name, Strict strict, PropertyLookupCache* caches = nullptr)
+inline ThrowCompletionOr<void> put_by_property_key(VM& vm, Value base, Value this_value, Value value, Optional<Utf16FlyString const&> const base_identifier, PropertyKey const& name, PutKind kind, Strict strict, PropertyLookupCache* caches = nullptr)
 {
     // Better error message than to_object would give
     if (strict == Strict::Yes && base.is_nullish()) [[unlikely]]
@@ -210,7 +209,7 @@ ThrowCompletionOr<void> put_by_property_key(VM& vm, Value base, Value this_value
         return throw_null_or_undefined_property_access(vm, base, base_identifier, name);
     auto object = maybe_object.release_value();
 
-    if constexpr (kind == PutKind::Getter || kind == PutKind::Setter) {
+    if (kind == PutKind::Getter || kind == PutKind::Setter) {
         // The generator should only pass us functions for getters and setters.
         VERIFY(value.is_function());
     }
@@ -330,7 +329,7 @@ ThrowCompletionOr<void> put_by_property_key(VM& vm, Value base, Value this_value
                 cache.property_offset = cacheable_metadata.property_offset.value();
                 cache.shape = &object->shape();
                 if (cacheable_metadata.prototype) {
-                    cache.prototype_chain_validity = *cacheable_metadata.prototype->shape().prototype_chain_validity();
+                    cache.prototype_chain_validity = cacheable_metadata.prototype->shape().prototype_chain_validity();
                 }
                 if (object->shape().is_dictionary()) {
                     cache.shape_dictionary_generation = object->shape().dictionary_generation();
@@ -349,7 +348,7 @@ ThrowCompletionOr<void> put_by_property_key(VM& vm, Value base, Value this_value
                 break;
             case CacheableSetPropertyMetadata::Type::ChangeOwnProperty:
                 caches->update(PropertyLookupCache::Entry::Type::ChangeOwnProperty, [&](auto& cache) {
-                    cache.shape = object->shape();
+                    cache.shape = &object->shape();
                     cache.property_offset = cacheable_metadata.property_offset.value();
 
                     if (object->shape().is_dictionary()) {
@@ -359,10 +358,10 @@ ThrowCompletionOr<void> put_by_property_key(VM& vm, Value base, Value this_value
                 break;
             case CacheableSetPropertyMetadata::Type::ChangePropertyInPrototypeChain:
                 caches->update(PropertyLookupCache::Entry::Type::ChangePropertyInPrototypeChain, [&](auto& cache) {
-                    cache.shape = object->shape();
+                    cache.shape = &object->shape();
                     cache.property_offset = cacheable_metadata.property_offset.value();
-                    cache.prototype = *cacheable_metadata.prototype;
-                    cache.prototype_chain_validity = *cacheable_metadata.prototype->shape().prototype_chain_validity();
+                    cache.prototype = const_cast<Object*>(cacheable_metadata.prototype.ptr());
+                    cache.prototype_chain_validity = cacheable_metadata.prototype->shape().prototype_chain_validity();
 
                     if (object->shape().is_dictionary()) {
                         cache.shape_dictionary_generation = object->shape().dictionary_generation();

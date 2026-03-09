@@ -20,8 +20,18 @@
 
 namespace Web::Layout {
 
+LayoutState::LayoutState(NodeWithStyle const& subtree_root)
+    : m_subtree_root(&subtree_root)
+{
+}
+
 LayoutState::~LayoutState()
 {
+}
+
+void LayoutState::ensure_capacity(u32 node_count)
+{
+    m_used_values_store.ensure_capacity(node_count);
 }
 
 LayoutState::UsedValues& LayoutState::get_mutable(NodeWithStyle const& node)
@@ -37,31 +47,67 @@ LayoutState::UsedValues const& LayoutState::get(NodeWithStyle const& node) const
 LayoutState::UsedValues& LayoutState::populate_from_paintable(NodeWithStyle const& node, Painting::PaintableBox const& paintable)
 {
     VERIFY(m_subtree_root);
-    auto new_used_values = adopt_own(*new UsedValues);
-    auto* new_used_values_ptr = new_used_values.ptr();
+    auto index = node.layout_index();
+
     // NOTE: We skip set_node() here since it performs size resolution that requires a containing block,
     //       and materialize_from_paintable() overwrites all computed sizes immediately after.
-    new_used_values->m_node = &node;
-    new_used_values_ptr->materialize_from_paintable(paintable);
-    used_values_per_layout_node.set(node, move(new_used_values));
-    return *new_used_values_ptr;
+    auto& used_values = m_used_values_store.allocate(index);
+    used_values.m_node = &node;
+    used_values.materialize_from_paintable(paintable);
+    return used_values;
+}
+
+LayoutState::UsedValues& LayoutState::populate_node_from(LayoutState const& source, NodeWithStyle const& node)
+{
+    VERIFY(m_subtree_root);
+    auto index = node.layout_index();
+    VERIFY(!m_used_values_store.get(index));
+
+    auto& values = m_used_values_store.allocate(index);
+    values = source.get(node);
+    values.m_containing_block_used_values = nullptr;
+    return values;
 }
 
 LayoutState::UsedValues& LayoutState::ensure_used_values_for(NodeWithStyle const& node)
 {
-    if (auto* used_values = used_values_per_layout_node.get(node).value_or(nullptr))
+    auto index = node.layout_index();
+
+    if (auto* used_values = m_used_values_store.get(index))
         return *used_values;
 
-    // During subtree layout, all nodes outside the subtree must be pre-populated before running the formatting context
+    // During subtree layout, only the subtree root and nodes inside the subtree are allowed.
     VERIFY(!m_subtree_root || m_subtree_root == &node || m_subtree_root->is_inclusive_ancestor_of(node));
 
-    auto const* containing_block_used_values = (node.is_viewport() || m_subtree_root == &node) ? nullptr : &get(*node.containing_block());
+    UsedValues const* containing_block_used_values = nullptr;
+    if (m_subtree_root == &node) {
+        // For the subtree root, ancestor values are not available in the throwaway state.
+        containing_block_used_values = try_get(*node.containing_block());
+    } else if (!node.is_viewport()) {
+        containing_block_used_values = &get(*node.containing_block());
+    }
 
-    auto new_used_values = adopt_own(*new UsedValues);
-    auto* new_used_values_ptr = new_used_values.ptr();
-    new_used_values->set_node(node, containing_block_used_values);
-    used_values_per_layout_node.set(node, move(new_used_values));
-    return *new_used_values_ptr;
+    auto& used_values = m_used_values_store.allocate(index);
+    used_values.set_node(node, containing_block_used_values);
+    return used_values;
+}
+
+LayoutState::UsedValues const* LayoutState::try_get(NodeWithStyle const& node) const
+{
+    return m_used_values_store.get(node.layout_index());
+}
+
+LayoutState::UsedValues* LayoutState::try_get_mutable(NodeWithStyle const& node)
+{
+    return m_used_values_store.get(node.layout_index());
+}
+
+LayoutState::UsedValues const* LayoutState::try_get(Node const& node) const
+{
+    auto* node_with_style = as_if<NodeWithStyle>(node);
+    if (!node_with_style)
+        return nullptr;
+    return try_get(*node_with_style);
 }
 
 // https://drafts.csswg.org/css-overflow-3/#scrollable-overflow-region
@@ -108,27 +154,32 @@ static CSSPixelRect measure_scrollable_overflow(Box const& box)
 
         auto child_border_box = child.paintable_box()->absolute_border_box_rect();
 
-        // Border boxes with zero area do not affect the scrollable overflow area.
-        if (child_border_box.is_empty())
-            return TraversalDecision::Continue;
-
         // NOTE: Here we check that the child is not wholly in the negative scrollable overflow region.
         if (child_border_box.bottom() < 0 || child_border_box.right() < 0)
             return TraversalDecision::Continue;
 
-        scrollable_overflow_rect.unite(child_border_box);
-        content_overflow_rect.unite(child_border_box);
+        // Border boxes with zero area do not affect the scrollable overflow area.
+        if (!child_border_box.is_empty()) {
+            scrollable_overflow_rect.unite(child_border_box);
+            content_overflow_rect.unite(child_border_box);
+        }
 
         // - The scrollable overflow areas of all of the above boxes (including zero-area boxes and accounting for
         //   transforms as described above), provided they themselves have overflow: visible (i.e. do not themselves
         //   trap the overflow) and that scrollable overflow is not already clipped (e.g. by the clip property or the
         //   contain property).
+        // Scrollable overflow is already clipped by the contain property.
+        if (child.has_layout_containment() || child.has_paint_containment())
+            return TraversalDecision::Continue;
+
         if (child.computed_values().overflow_x() == CSS::Overflow::Visible || child.computed_values().overflow_y() == CSS::Overflow::Visible) {
             auto child_scrollable_overflow = measure_scrollable_overflow(child);
-            if (child.computed_values().overflow_x() == CSS::Overflow::Visible)
-                scrollable_overflow_rect.unite_horizontally(child_scrollable_overflow);
-            if (child.computed_values().overflow_y() == CSS::Overflow::Visible)
-                scrollable_overflow_rect.unite_vertically(child_scrollable_overflow);
+            if (!child_scrollable_overflow.is_empty()) {
+                if (child.computed_values().overflow_x() == CSS::Overflow::Visible)
+                    scrollable_overflow_rect.unite_horizontally(child_scrollable_overflow);
+                if (child.computed_values().overflow_y() == CSS::Overflow::Visible)
+                    scrollable_overflow_rect.unite_vertically(child_scrollable_overflow);
+            }
         }
 
         return TraversalDecision::Continue;
@@ -177,8 +228,7 @@ void LayoutState::resolve_relative_positions()
 {
     // This function resolves relative position offsets of fragments that belong to inline paintables.
     // It runs *after* the paint tree has been constructed, so it modifies paintable node & fragment offsets directly.
-    for (auto& it : used_values_per_layout_node) {
-        auto& used_values = *it.value;
+    m_used_values_store.for_each([&](UsedValues& used_values) {
         auto& node = const_cast<NodeWithStyle&>(used_values.node());
 
         for (auto& paintable : node.paintables()) {
@@ -207,7 +257,7 @@ void LayoutState::resolve_relative_positions()
                 const_cast<Painting::PaintableFragment&>(fragment).set_offset(fragment.offset().translated(offset));
             }
         }
-    }
+    });
 }
 
 static void build_paint_tree(Node& node, Painting::Paintable* parent_paintable = nullptr)
@@ -294,7 +344,7 @@ void LayoutState::commit(Box& root)
                 auto& inline_node = const_cast<InlineNode&>(static_cast<InlineNode const&>(*parent));
                 auto line_paintable = inline_node.create_paintable_for_line_with_index(line_index);
                 line_paintable->add_fragment(fragment);
-                if (auto const* used_values = used_values_per_layout_node.get(inline_node).value_or(nullptr))
+                if (auto const* used_values = try_get(inline_node))
                     transfer_box_model_metrics(line_paintable->box_model(), *used_values);
                 if (!inline_node_paintables.contains(line_paintable.ptr())) {
                     inline_node_paintables.set(line_paintable.ptr());
@@ -306,12 +356,11 @@ void LayoutState::commit(Box& root)
         return false;
     };
 
-    for (auto& it : used_values_per_layout_node) {
-        auto& used_values = *it.value;
+    m_used_values_store.for_each([&](UsedValues& used_values) {
         auto& node = used_values.node();
 
         if (m_subtree_root && !m_subtree_root->is_inclusive_ancestor_of(node))
-            continue;
+            return;
 
         GC::Ptr<Painting::Paintable> paintable;
 
@@ -367,7 +416,7 @@ void LayoutState::commit(Box& root)
                 paintable_box->set_used_values_for_grid_template_rows(used_values.grid_template_rows());
             }
         }
-    }
+    });
 
     // Create paintables for inline nodes without fragments to make possible querying their geometry.
     for (auto& inline_node : inline_nodes) {
@@ -377,19 +426,18 @@ void LayoutState::commit(Box& root)
         auto line_paintable = inline_node->create_paintable_for_line_with_index(0);
         inline_node->add_paintable(line_paintable);
         inline_node_paintables.set(line_paintable.ptr());
-        if (auto const* used_values = used_values_per_layout_node.get(*inline_node).value_or(nullptr))
+        if (auto const* used_values = try_get(*inline_node))
             transfer_box_model_metrics(line_paintable->box_model(), *used_values);
     }
 
     // Resolve relative positions for regular boxes (not line box fragments):
     // NOTE: This needs to occur before fragments are transferred into the corresponding inline paintables, because
     //       after this transfer, the containing_line_box_fragment will no longer be valid.
-    for (auto& it : used_values_per_layout_node) {
-        auto& used_values = *it.value;
+    m_used_values_store.for_each([&](UsedValues& used_values) {
         auto& node = const_cast<NodeWithStyle&>(used_values.node());
 
         if (!node.is_box())
-            continue;
+            return;
 
         auto& paintable = as<Painting::PaintableBox>(*node.first_paintable());
         CSSPixelPoint offset;
@@ -416,7 +464,7 @@ void LayoutState::commit(Box& root)
             offset.translate_by(inset.left, inset.top);
         }
         paintable.set_offset(offset);
-    }
+    });
 
     for (auto* text_node : text_nodes)
         text_node->add_paintable(text_node->create_paintable());
@@ -439,16 +487,16 @@ void LayoutState::commit(Box& root)
             if (is<BlockContainer>(paintable.layout_node()))
                 return TraversalDecision::Continue;
 
-            auto used_values = used_values_per_layout_node.get(paintable.layout_node_with_style_and_box_metrics());
-            if (&paintable != paintable_with_lines && used_values.has_value())
-                size.set_width(size.width() + used_values.value()->margin_box_left() + used_values.value()->margin_box_right());
+            auto const* used_values = try_get(paintable.layout_node_with_style_and_box_metrics());
+            if (&paintable != paintable_with_lines && used_values)
+                size.set_width(size.width() + used_values->margin_box_left() + used_values->margin_box_right());
 
             auto const& fragments = paintable.fragments();
             if (!fragments.is_empty()) {
                 if (!offset.has_value() || (fragments.first().offset().x() < offset->x()))
                     offset = fragments.first().offset();
-                if (&paintable == paintable_with_lines->first_child() && used_values.has_value())
-                    offset->translate_by(-used_values.value()->margin_box_left(), 0);
+                if (&paintable == paintable_with_lines->first_child() && used_values)
+                    offset->translate_by(-used_values->margin_box_left(), 0);
             }
             for (auto const& fragment : fragments)
                 size.set_width(size.width() + fragment.width());
@@ -476,11 +524,10 @@ void LayoutState::commit(Box& root)
     }
 
     // Measure overflow in scroll containers.
-    for (auto& it : used_values_per_layout_node) {
-        auto& used_values = *it.value;
+    m_used_values_store.for_each([&](UsedValues& used_values) {
         auto const* box = as_if<Box>(used_values.node());
         if (!box)
-            continue;
+            return;
         measure_scrollable_overflow(*box);
 
         // The scroll offset can become invalid if the scrollable overflow rectangle has changed after layout.
@@ -489,10 +536,9 @@ void LayoutState::commit(Box& root)
         auto& paintable_box = const_cast<Painting::PaintableBox&>(*box->paintable_box());
         if (!paintable_box.scroll_offset().is_zero())
             paintable_box.set_scroll_offset(paintable_box.scroll_offset());
-    }
+    });
 
-    for (auto& it : used_values_per_layout_node) {
-        auto& used_values = *it.value;
+    m_used_values_store.for_each([&](UsedValues& used_values) {
         auto& node = used_values.node();
         for (auto& paintable : node.paintables()) {
             auto* paintable_box = as_if<Painting::PaintableBox>(paintable);
@@ -523,7 +569,7 @@ void LayoutState::commit(Box& root)
                 paintable_box->set_sticky_insets(move(sticky_insets));
             }
         }
-    }
+    });
 }
 
 void LayoutState::UsedValues::set_node(NodeWithStyle const& node, UsedValues const* containing_block_used_values)

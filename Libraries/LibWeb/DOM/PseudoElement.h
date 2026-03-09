@@ -9,7 +9,6 @@
 #include <AK/OwnPtr.h>
 #include <LibGC/CellAllocator.h>
 #include <LibJS/Heap/Cell.h>
-#include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -23,6 +22,7 @@ class WEB_API PseudoElement : public JS::Cell {
     GC_DECLARE_ALLOCATOR(PseudoElement);
 
     GC::Ptr<Layout::NodeWithStyle> layout_node() const { return m_layout_node; }
+    GC::Ptr<Layout::NodeWithStyle> unsafe_layout_node() const { return m_layout_node; }
     void set_layout_node(GC::Ptr<Layout::NodeWithStyle> value) { m_layout_node = value; }
 
     GC::Ptr<CSS::CascadedProperties> cascaded_properties() const { return m_cascaded_properties; }

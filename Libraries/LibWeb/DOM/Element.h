@@ -230,6 +230,9 @@ public:
     GC::Ptr<Layout::NodeWithStyle> layout_node();
     GC::Ptr<Layout::NodeWithStyle const> layout_node() const;
 
+    GC::Ptr<Layout::NodeWithStyle> unsafe_layout_node();
+    GC::Ptr<Layout::NodeWithStyle const> unsafe_layout_node() const;
+
     GC::Ptr<CSS::ComputedProperties> computed_properties(Optional<CSS::PseudoElement> = {});
     GC::Ptr<CSS::ComputedProperties const> computed_properties(Optional<CSS::PseudoElement> = {}) const;
     void set_computed_properties(Optional<CSS::PseudoElement>, GC::Ptr<CSS::ComputedProperties>);
@@ -261,6 +264,21 @@ public:
     WebIDL::ExceptionOr<String> get_html(GetHTMLOptions const&) const;
 
     WebIDL::ExceptionOr<void> insert_adjacent_html(String const& position, TrustedTypes::TrustedHTMLOrString const&);
+
+    enum class FullscreenRequester {
+        Bindings,
+        WebDriver,
+    };
+    GC::Ref<WebIDL::Promise> request_fullscreen(FullscreenRequester = FullscreenRequester::Bindings);
+
+    void set_fullscreen_flag(bool is_fullscreen) { m_fullscreen_flag = is_fullscreen; }
+    bool is_fullscreen_element() const { return m_fullscreen_flag; }
+
+    GC::Ptr<WebIDL::CallbackType> onfullscreenchange();
+    void set_onfullscreenchange(GC::Ptr<WebIDL::CallbackType>);
+
+    GC::Ptr<WebIDL::CallbackType> onfullscreenerror();
+    void set_onfullscreenerror(GC::Ptr<WebIDL::CallbackType>);
 
     WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> outer_html() const;
     WebIDL::ExceptionOr<void> set_outer_html(TrustedTypes::TrustedHTMLOrString const&);
@@ -487,18 +505,29 @@ public:
     bool affected_by_indirect_sibling_combinator() const { return m_affected_by_indirect_sibling_combinator; }
     void set_affected_by_indirect_sibling_combinator(bool value) { m_affected_by_indirect_sibling_combinator = value; }
 
-    bool affected_by_sibling_position_or_count_pseudo_class() const { return m_affected_by_sibling_position_or_count_pseudo_class; }
-    void set_affected_by_sibling_position_or_count_pseudo_class(bool value) { m_affected_by_sibling_position_or_count_pseudo_class = value; }
+    bool affected_by_first_child_pseudo_class() const { return m_affected_by_first_child_pseudo_class; }
+    void set_affected_by_first_child_pseudo_class(bool value) { m_affected_by_first_child_pseudo_class = value; }
 
-    bool affected_by_nth_child_pseudo_class() const { return m_affected_by_nth_child_pseudo_class; }
-    void set_affected_by_nth_child_pseudo_class(bool value) { m_affected_by_nth_child_pseudo_class = value; }
+    bool affected_by_last_child_pseudo_class() const { return m_affected_by_last_child_pseudo_class; }
+    void set_affected_by_last_child_pseudo_class(bool value) { m_affected_by_last_child_pseudo_class = value; }
+
+    bool affected_by_forward_positional_pseudo_class() const { return m_affected_by_forward_positional_pseudo_class; }
+    void set_affected_by_forward_positional_pseudo_class(bool value) { m_affected_by_forward_positional_pseudo_class = value; }
+
+    bool affected_by_backward_positional_pseudo_class() const { return m_affected_by_backward_positional_pseudo_class; }
+    void set_affected_by_backward_positional_pseudo_class(bool value) { m_affected_by_backward_positional_pseudo_class = value; }
 
     size_t sibling_invalidation_distance() const { return m_sibling_invalidation_distance; }
     void set_sibling_invalidation_distance(size_t value) { m_sibling_invalidation_distance = value; }
 
-    bool style_affected_by_structural_changes() const
+    bool affected_by_forward_structural_changes() const
     {
-        return affected_by_direct_sibling_combinator() || affected_by_indirect_sibling_combinator() || affected_by_sibling_position_or_count_pseudo_class() || affected_by_nth_child_pseudo_class();
+        return affected_by_direct_sibling_combinator() || affected_by_indirect_sibling_combinator() || affected_by_first_child_pseudo_class() || affected_by_forward_positional_pseudo_class();
+    }
+
+    bool affected_by_backward_structural_changes() const
+    {
+        return affected_by_last_child_pseudo_class() || affected_by_backward_positional_pseudo_class();
     }
 
     i32 number_of_owned_list_items() const;
@@ -570,6 +599,19 @@ private:
     FlyString make_html_uppercased_qualified_name() const;
 
     void invalidate_style_after_attribute_change(FlyString const& attribute_name, Optional<String> const& old_value, Optional<String> const& new_value);
+
+    enum class RequestFullscreenError : u8 {
+        False,
+        ElementReadyCheckFailed,
+        UnsupportedElement,
+        NoTransientUserActivation,
+        ElementNodeDocIsNotPendingDoc
+    };
+    static Utf16String request_fullscreen_error_to_string(RequestFullscreenError);
+
+    void exit_fullscreen_on_element_removal();
+    RequestFullscreenError is_element_allowed_to_enter_fullscreen(FullscreenRequester) const;
+    bool is_element_ready_for_fullscreen() const;
 
     WebIDL::ExceptionOr<GC::Ptr<Node>> insert_adjacent(StringView where, GC::Ref<Node> node);
 
@@ -650,9 +692,12 @@ private:
     bool m_affected_by_has_pseudo_class_in_non_subject_position : 1 { false };
     bool m_affected_by_direct_sibling_combinator : 1 { false };
     bool m_affected_by_indirect_sibling_combinator : 1 { false };
-    bool m_affected_by_sibling_position_or_count_pseudo_class : 1 { false };
-    bool m_affected_by_nth_child_pseudo_class : 1 { false };
+    bool m_affected_by_first_child_pseudo_class : 1 { false };
+    bool m_affected_by_last_child_pseudo_class : 1 { false };
+    bool m_affected_by_forward_positional_pseudo_class : 1 { false };
+    bool m_affected_by_backward_positional_pseudo_class : 1 { false };
     bool m_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator : 1 { false };
+    bool m_fullscreen_flag : 1 { false };
 
     size_t m_sibling_invalidation_distance { 0 };
 

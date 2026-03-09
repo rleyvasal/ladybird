@@ -18,6 +18,7 @@
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/DOM/StyleInvalidationReason.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/TraversalDecision.h>
 #include <LibWeb/TreeNode.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -70,6 +71,7 @@ enum class SetNeedsLayoutReason {
 
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASONS(X) \
     X(ElementSetInnerHTML)                                \
+    X(ElementSetShadowRoot)                               \
     X(DetailsElementOpenedOrClosed)                       \
     X(HTMLInputElementSrcAttribute)                       \
     X(HTMLOListElementOrdinalValues)                      \
@@ -148,6 +150,9 @@ public:
     bool is_editing_host() const;
     bool is_editable_or_editing_host() const { return is_editable() || is_editing_host(); }
     GC::Ptr<Node> editing_host();
+
+    bool in_editable_subtree() const { return m_in_editable_subtree; }
+    void recompute_editable_subtree_flag();
 
     virtual bool is_dom_node() const final { return true; }
     virtual bool is_html_element() const { return false; }
@@ -281,7 +286,7 @@ public:
     MUST_UPCALL virtual void inserted();
     virtual void post_connection();
     MUST_UPCALL virtual void removed_from(Node* old_parent, Node& old_root);
-    virtual void moved_from(GC::Ptr<Node> old_parent);
+    MUST_UPCALL virtual void moved_from(GC::Ptr<Node> old_parent);
 
     struct ChildrenChangedMetadata {
         enum class Type {
@@ -298,16 +303,27 @@ public:
     virtual void adopted_from(Document&) { }
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const { return {}; }
 
-    Layout::Node const* layout_node() const { return m_layout_node; }
-    Layout::Node* layout_node() { return m_layout_node; }
+    Layout::Node const* layout_node() const;
+    Layout::Node* layout_node();
+
+    Layout::Node const* unsafe_layout_node() const { return m_layout_node; }
+    Layout::Node* unsafe_layout_node() { return m_layout_node; }
 
     Painting::PaintableBox const* paintable_box() const;
     Painting::PaintableBox* paintable_box();
     Painting::Paintable const* paintable() const;
     Painting::Paintable* paintable();
 
+    Painting::PaintableBox const* unsafe_paintable_box() const;
+    Painting::PaintableBox* unsafe_paintable_box();
+    Painting::Paintable const* unsafe_paintable() const { return m_paintable; }
+    Painting::Paintable* unsafe_paintable() { return m_paintable; }
+
     void set_paintable(GC::Ptr<Painting::Paintable>);
     void clear_paintable();
+
+    void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
+    void set_needs_layout_update(SetNeedsLayoutReason);
 
     void set_layout_node(Badge<Layout::Node>, GC::Ref<Layout::Node>);
     void detach_layout_node(Badge<Layout::TreeBuilder>);
@@ -464,6 +480,7 @@ protected:
     bool m_needs_style_update { false };
     bool m_child_needs_style_update { false };
     bool m_entire_subtree_needs_style_update { false };
+    bool m_in_editable_subtree { false };
 
     UniqueNodeID m_unique_id;
 

@@ -184,6 +184,24 @@ static ThrowCompletionOr<ScopedOperand> constant_fold_binary_expression(Generato
     }
 }
 
+static bool might_contain_assignment_expression(Expression const& expression)
+{
+    if (expression.is_numeric_literal() || expression.is_string_literal() || expression.is_boolean_literal() || expression.is_null_literal() || expression.is_identifier())
+        return false;
+
+    if (auto const* unary_expression = as_if<UnaryExpression>(expression))
+        return might_contain_assignment_expression(unary_expression->lhs());
+
+    if (auto const* binary_expression = as_if<BinaryExpression>(expression))
+        return might_contain_assignment_expression(binary_expression->lhs()) || might_contain_assignment_expression(binary_expression->rhs());
+
+    if (auto const* member_expression = as_if<MemberExpression>(expression))
+        return might_contain_assignment_expression(member_expression->object()) || might_contain_assignment_expression(member_expression->property());
+
+    // Conservatively consider everything else, including assignments themselves as potentially assigning.
+    return true;
+}
+
 Optional<ScopedOperand> BinaryExpression::generate_bytecode(Bytecode::Generator& generator, Optional<ScopedOperand> preferred_dst) const
 {
     Bytecode::Generator::SourceLocationScope scope(generator, *this);
@@ -247,6 +265,15 @@ Optional<ScopedOperand> BinaryExpression::generate_bytecode(Bytecode::Generator&
     };
 
     auto lhs = get_left_side(*m_lhs).value();
+    // OPTIMIZATION: We do need to make a copy of the LHS here in case evaluation of the RHS
+    // reassigns it. However, binary expressions are a pretty common thing, so doing the copy
+    // unconditionally is a noticable performance hit, especially because in practice, the copy is
+    // almost never needed. We add a small heuristic here that detects the most common cases.
+    // FIXME: This is a pretty narrow optimization. Maybe instead, it would make sense to have a
+    // more general "remove unnecessary mov-operations" as part of a bytecode optimization pass.
+    if (might_contain_assignment_expression(m_rhs))
+        lhs = generator.copy_if_needed_to_preserve_evaluation_order(lhs);
+
     auto rhs = get_right_side(*m_rhs).value();
     auto dst = choose_dst(generator, preferred_dst);
 
@@ -555,17 +582,8 @@ Optional<ScopedOperand> Identifier::generate_bytecode(Bytecode::Generator& gener
     Bytecode::Generator::SourceLocationScope scope(generator, *this);
 
     if (is_local()) {
-        auto local_index = this->local_index();
-        auto local = generator.local(local_index);
-        if (!generator.is_local_initialized(local_index)) {
-            if (local_index.is_argument()) {
-                // Arguments are initialized to undefined by default, so here we need to replace it with the empty value to
-                // trigger the TDZ check.
-                generator.emit<Bytecode::Op::Mov>(local, generator.add_constant(js_special_empty_value()));
-            }
-            generator.emit<Bytecode::Op::ThrowIfTDZ>(local);
-        }
-        return local;
+        generator.emit_tdz_check_if_needed(*this);
+        return generator.local(local_index());
     }
 
     if (is_global()) {
@@ -711,8 +729,7 @@ Optional<ScopedOperand> AssignmentExpression::generate_bytecode(Bytecode::Genera
                     generator.emit<Bytecode::Op::NewReferenceError>(exception, generator.intern_string(ErrorType::InvalidLeftHandAssignment.message()));
                     generator.perform_needed_unwinds<Bytecode::Op::Throw>();
                     generator.emit<Bytecode::Op::Throw>(exception);
-                    generator.switch_to_basic_block(generator.make_block());
-                    return generator.add_constant(js_undefined());
+                    return {};
                 }
 
                 // c. If IsAnonymousFunctionDefinition(AssignmentExpression) and IsIdentifierRef of LeftHandSideExpression are both true, then
@@ -731,13 +748,8 @@ Optional<ScopedOperand> AssignmentExpression::generate_bytecode(Bytecode::Genera
                 // e. Perform ? PutValue(lref, rval).
                 if (is<Identifier>(*lhs)) {
                     auto& identifier = static_cast<Identifier const&>(*lhs);
-                    if (identifier.is_local()) {
-                        auto is_initialized = generator.is_local_initialized(identifier.local_index());
-                        auto is_lexically_declared = generator.is_local_lexically_declared(identifier.local_index());
-                        if (is_lexically_declared && !is_initialized) {
-                            generator.emit<Bytecode::Op::ThrowIfTDZ>(generator.local(identifier.local_index()));
-                        }
-                    }
+                    if (identifier.is_local())
+                        generator.emit_tdz_check_if_needed(identifier);
                     generator.emit_set_variable(identifier, rval);
                 } else if (is<MemberExpression>(*lhs)) {
                     auto& expression = static_cast<MemberExpression const&>(*lhs);
@@ -753,7 +765,7 @@ Optional<ScopedOperand> AssignmentExpression::generate_bytecode(Bytecode::Genera
                         if (!lhs_is_super_expression)
                             generator.emit_put_by_id(*base, property_key_table_index, rval, Bytecode::PutKind::Normal, generator.next_property_lookup_cache(), move(base_identifier));
                         else
-                            generator.emit<Bytecode::Op::PutNormalByIdWithThis>(*base, *this_value, property_key_table_index, rval, generator.next_property_lookup_cache());
+                            generator.emit<Bytecode::Op::PutByIdWithThis>(*base, *this_value, property_key_table_index, rval, Bytecode::PutKind::Normal, generator.next_property_lookup_cache());
                     } else if (expression.property().is_private_identifier()) {
                         auto identifier_table_ref = generator.intern_identifier(as<PrivateIdentifier>(expression.property()).string());
                         generator.emit<Bytecode::Op::PutPrivateById>(*base, identifier_table_ref, rval);
@@ -785,7 +797,12 @@ Optional<ScopedOperand> AssignmentExpression::generate_bytecode(Bytecode::Genera
     auto& lhs_expression = m_lhs.get<NonnullRefPtr<Expression const>>();
 
     auto reference_operands = generator.emit_load_from_reference(lhs_expression);
+
+    if (!reference_operands.loaded_value.has_value())
+        return {};
+
     auto lhs = reference_operands.loaded_value.value();
+    lhs = generator.copy_if_needed_to_preserve_evaluation_order(lhs);
 
     Bytecode::BasicBlock* rhs_block_ptr { nullptr };
     Bytecode::BasicBlock* lhs_block_ptr { nullptr };
@@ -1350,6 +1367,7 @@ Optional<ScopedOperand> ObjectExpression::generate_bytecode(Bytecode::Generator&
             }
         } else {
             auto property_name = property->key().generate_bytecode(generator).value();
+            property_name = generator.copy_if_needed_to_preserve_evaluation_order(property_name);
 
             // ComputedPropertyName evaluation calls ToPropertyKey, which includes ToPrimitive(hint: string).
             // This must happen before the value expression is evaluated per the spec for
@@ -1622,8 +1640,6 @@ static void generate_array_binding_pattern_bytecode(Bytecode::Generator& generat
                 generator.emit_store_to_reference(*expr, value);
             });
     };
-
-    auto temp_iterator_result = generator.allocate_register();
 
     for (auto& [name, alias, initializer, is_rest] : pattern.entries) {
         VERIFY(name.has<Empty>());
@@ -1935,11 +1951,8 @@ Optional<ScopedOperand> CallExpression::generate_bytecode(Bytecode::Generator& g
             call_type = Bytecode::Op::CallType::DirectEval;
         }
         if (identifier.is_local()) {
-            auto local = generator.local(identifier.local_index());
-            if (!generator.is_local_initialized(local.operand().index())) {
-                generator.emit<Bytecode::Op::ThrowIfTDZ>(local);
-            }
-            original_callee = local;
+            generator.emit_tdz_check_if_needed(identifier);
+            original_callee = generator.local(identifier.local_index());
         } else if (identifier.is_global()) {
             original_callee = m_callee->generate_bytecode(generator).value();
         } else {
@@ -2803,6 +2816,9 @@ Optional<ScopedOperand> UpdateExpression::generate_bytecode(Bytecode::Generator&
     Bytecode::Generator::SourceLocationScope scope(generator, *this);
     auto reference = generator.emit_load_from_reference(*m_argument);
 
+    if (!reference.loaded_value.has_value())
+        return {};
+
     Optional<ScopedOperand> previous_value_for_postfix;
 
     if (m_op == UpdateOp::Increment) {
@@ -3244,8 +3260,6 @@ Optional<ScopedOperand> SwitchStatement::generate_labelled_evaluation(Bytecode::
                 if (generator.must_propagate_completion()) {
                     if (result.has_value())
                         generator.emit_mov(*completion, *result);
-                    else
-                        generator.emit_mov(*completion, generator.add_constant(js_undefined()));
                 }
             }
         }
@@ -4015,7 +4029,7 @@ static Optional<ScopedOperand> for_in_of_body_evaluation(Bytecode::Generator& ge
     //     by the synthetic FinallyContext set up above (for iterate/async-iterate).
 
     // l. Let result be the result of evaluating stmt.
-    {
+    if (!generator.is_current_block_terminated()) {
         Optional<Bytecode::Generator::CompletionRegisterScope> completion_scope;
         if (completion.has_value())
             completion_scope.emplace(generator, *completion);
@@ -4270,7 +4284,12 @@ Optional<ScopedOperand> MetaProperty::generate_bytecode(Bytecode::Generator& gen
 Optional<ScopedOperand> ClassFieldInitializerStatement::generate_bytecode(Bytecode::Generator& generator, Optional<ScopedOperand> preferred_dst) const
 {
     Bytecode::Generator::SourceLocationScope scope(generator, *this);
-    auto value = generator.emit_named_evaluation_if_anonymous_function(*m_expression, generator.intern_identifier(m_class_field_identifier_name), preferred_dst);
+    // Only set lhs_name for compile-time-known keys (non-empty names).
+    // For computed keys, m_class_field_identifier_name is empty and the name is set at runtime.
+    Optional<IdentifierTableIndex> lhs_name;
+    if (!m_class_field_identifier_name.is_empty())
+        lhs_name = generator.intern_identifier(m_class_field_identifier_name);
+    auto value = generator.emit_named_evaluation_if_anonymous_function(*m_expression, lhs_name, preferred_dst);
     generator.perform_needed_unwinds<Bytecode::Op::Return>();
     generator.emit<Bytecode::Op::Return>(value.operand());
     return value;
@@ -4380,19 +4399,8 @@ Optional<ScopedOperand> ExportStatement::generate_bytecode(Bytecode::Generator& 
         return m_statement->generate_bytecode(generator);
     }
 
-    if (is<ClassExpression>(*m_statement)) {
-        auto value = generator.emit_named_evaluation_if_anonymous_function(static_cast<ClassExpression const&>(*m_statement), generator.intern_identifier("default"_utf16_fly_string));
-
-        if (!static_cast<ClassExpression const&>(*m_statement).has_name()) {
-            generator.emit<Bytecode::Op::InitializeLexicalBinding>(
-                generator.intern_identifier(ExportStatement::local_name_for_default),
-                value);
-        }
-
-        return value;
-    }
-
     // ExportDeclaration : export default AssignmentExpression ;
+    // Always initialize the *default* binding per step 5 of the spec.
     VERIFY(is<Expression>(*m_statement));
     auto value = generator.emit_named_evaluation_if_anonymous_function(static_cast<Expression const&>(*m_statement), generator.intern_identifier("default"_utf16_fly_string));
     generator.emit<Bytecode::Op::InitializeLexicalBinding>(

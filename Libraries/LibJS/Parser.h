@@ -196,7 +196,12 @@ public:
 
     Vector<CallExpression::Argument> parse_arguments();
 
-    void run_scope_analysis() { m_scope_collector.analyze(); }
+    void run_scope_analysis()
+    {
+        compile_regex_literals();
+        m_scope_collector.analyze();
+    }
+    void set_is_dynamic_function() { m_is_dynamic_function = true; }
 
     bool has_errors() const { return m_state.errors.size(); }
     Vector<ParserError> const& errors() const { return m_state.errors; }
@@ -245,6 +250,7 @@ private:
     Token consume(TokenType type);
     Token consume_and_validate_numeric_literal();
     void consume_or_insert_semicolon();
+    void compile_regex_literals();
     void save_state();
     void load_state();
     void discard_saved_state();
@@ -328,6 +334,11 @@ private:
     ScopeCollector& scope_collector() { return m_scope_collector_override ? *m_scope_collector_override : m_scope_collector; }
     ScopeCollector const& scope_collector() const { return m_scope_collector_override ? *m_scope_collector_override : m_scope_collector; }
 
+    struct DeferredRegexLiteral {
+        NonnullRefPtr<RegExpLiteral const> literal;
+        Position position;
+    };
+
     NonnullRefPtr<SourceCode const> m_source_code;
     Vector<Position> m_rule_starts;
     ParserState m_state;
@@ -335,8 +346,12 @@ private:
     HashMap<Utf16FlyString, Optional<Position>> m_labels_in_scope;
     HashMap<size_t, TokenMemoization> m_token_memoizations;
     Program::Type m_program_type;
+    bool m_is_dynamic_function { false };
     ScopeCollector m_scope_collector;
     ScopeCollector* m_scope_collector_override { nullptr };
+
+    Vector<DeferredRegexLiteral> m_deferred_regex_literals;
+    Vector<size_t> m_saved_deferred_regex_sizes;
 };
 
 }

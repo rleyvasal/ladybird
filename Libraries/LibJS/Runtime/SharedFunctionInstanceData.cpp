@@ -7,6 +7,7 @@
 #include <LibJS/AST.h>
 #include <LibJS/Runtime/SharedFunctionInstanceData.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibJS/RustIntegration.h>
 
 namespace JS {
 
@@ -77,9 +78,7 @@ SharedFunctionInstanceData::SharedFunctionInstanceData(
     //       and then reused in all subsequent function instantiations.
 
     // 2. Let code be func.[[ECMAScriptCode]].
-    ScopeNode const* scope_body = nullptr;
-    if (is<ScopeNode>(*m_ecmascript_code))
-        scope_body = static_cast<ScopeNode const*>(m_ecmascript_code.ptr());
+    auto const* scope_body = as_if<ScopeNode>(*m_ecmascript_code);
     m_has_scope_body = scope_body != nullptr;
 
     // 3. Let strict be func.[[Strict]].
@@ -300,12 +299,50 @@ void SharedFunctionInstanceData::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_executable);
+    visitor.visit(m_cpp_comparison_sfd);
     for (auto& function : m_functions_to_initialize)
         visitor.visit(function.shared_data);
     m_class_field_initializer_name.visit([&](PropertyKey const& key) { key.visit_edges(visitor); }, [](auto&) {});
 }
 
 SharedFunctionInstanceData::~SharedFunctionInstanceData() = default;
+
+void SharedFunctionInstanceData::finalize()
+{
+    Base::finalize();
+    RustIntegration::free_function_ast(m_rust_function_ast);
+    m_rust_function_ast = nullptr;
+}
+
+SharedFunctionInstanceData::SharedFunctionInstanceData(
+    VM&,
+    FunctionKind kind,
+    Utf16FlyString name,
+    i32 function_length,
+    u32 formal_parameter_count,
+    bool strict,
+    bool is_arrow_function,
+    bool has_simple_parameter_list,
+    Vector<Utf16FlyString> parameter_names_for_mapped_arguments,
+    void* rust_function_ast)
+    : m_name(move(name))
+    , m_function_length(function_length)
+    , m_formal_parameter_count(formal_parameter_count)
+    , m_parameter_names_for_mapped_arguments(move(parameter_names_for_mapped_arguments))
+    , m_kind(kind)
+    , m_strict(strict)
+    , m_is_arrow_function(is_arrow_function)
+    , m_has_simple_parameter_list(has_simple_parameter_list)
+    , m_rust_function_ast(rust_function_ast)
+    , m_use_rust_compilation(true)
+{
+    if (m_is_arrow_function)
+        m_this_mode = ThisMode::Lexical;
+    else if (m_strict)
+        m_this_mode = ThisMode::Strict;
+    else
+        m_this_mode = ThisMode::Global;
+}
 
 GC::Ref<SharedFunctionInstanceData> SharedFunctionInstanceData::create_for_function_node(VM& vm, FunctionNode const& node)
 {
@@ -342,6 +379,9 @@ void SharedFunctionInstanceData::clear_compile_inputs()
     m_functions_to_initialize.clear();
     m_var_names_to_initialize_binding.clear();
     m_lexical_bindings.clear();
+    RustIntegration::free_function_ast(m_rust_function_ast);
+    m_rust_function_ast = nullptr;
+    m_cpp_comparison_sfd = nullptr;
 }
 
 }

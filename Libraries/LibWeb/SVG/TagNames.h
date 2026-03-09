@@ -21,6 +21,7 @@ namespace Web::SVG::TagNames {
     __ENUMERATE_SVG_TAG(feColorMatrix)       \
     __ENUMERATE_SVG_TAG(feComponentTransfer) \
     __ENUMERATE_SVG_TAG(feComposite)         \
+    __ENUMERATE_SVG_TAG(feDisplacementMap)   \
     __ENUMERATE_SVG_TAG(feDropShadow)        \
     __ENUMERATE_SVG_TAG(feFlood)             \
     __ENUMERATE_SVG_TAG(feFuncA)             \
@@ -43,6 +44,7 @@ namespace Web::SVG::TagNames {
     __ENUMERATE_SVG_TAG(mask)                \
     __ENUMERATE_SVG_TAG(metadata)            \
     __ENUMERATE_SVG_TAG(path)                \
+    __ENUMERATE_SVG_TAG(pattern)             \
     __ENUMERATE_SVG_TAG(polygon)             \
     __ENUMERATE_SVG_TAG(polyline)            \
     __ENUMERATE_SVG_TAG(radialGradient)      \

@@ -9,6 +9,7 @@
 
 #include <AK/Debug.h>
 #include <AK/Function.h>
+#include <LibGC/DeferGC.h>
 #include <LibJS/AST.h>
 #include <LibJS/Bytecode/BasicBlock.h>
 #include <LibJS/Bytecode/Generator.h>
@@ -29,6 +30,7 @@
 #include <LibJS/Runtime/PromiseConstructor.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibJS/Runtime/ValueInlines.h>
+#include <LibJS/RustIntegration.h>
 
 namespace JS {
 
@@ -160,6 +162,7 @@ ECMAScriptFunctionObject::ECMAScriptFunctionObject(
     , m_environment(parent_environment)
     , m_private_environment(private_environment)
 {
+    set_is_ecmascript_function_object();
     if (!is_arrow_function() && kind() == FunctionKind::Normal)
         unsafe_set_shape(realm()->intrinsics().normal_function_shape());
 
@@ -217,7 +220,13 @@ void ECMAScriptFunctionObject::get_stack_frame_size(size_t& registers_and_locals
 {
     auto& executable = shared_data().m_executable;
     if (!executable) {
-        if (is_module_wrapper()) {
+        auto rust_executable = RustIntegration::compile_function(vm(), *m_shared_data, false);
+        if (rust_executable) {
+            executable = rust_executable;
+            executable->name = m_shared_data->m_name;
+            if (Bytecode::g_dump_bytecode)
+                executable->dump();
+        } else if (is_module_wrapper()) {
             executable = Bytecode::compile(vm(), ecmascript_code(), kind(), name());
         } else {
             executable = Bytecode::compile(vm(), shared_data(), Bytecode::BuiltinAbstractOperationsEnabled::No);

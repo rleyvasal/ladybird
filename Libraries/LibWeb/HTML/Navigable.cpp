@@ -54,6 +54,7 @@
 #include <LibWeb/Painting/DisplayListPlayerSkia.h>
 #include <LibWeb/Painting/NavigableContainerViewportPaintable.h>
 #include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
@@ -441,11 +442,22 @@ void Navigable::set_ongoing_navigation(Variant<Empty, Traversal, String> ongoing
     inform_the_navigation_api_about_aborting_navigation();
 
     // 3. Set navigable's ongoing navigation to newValue.
+    auto was_traversal = m_ongoing_navigation.has<Traversal>();
     m_ongoing_navigation = ongoing_navigation;
 
     for (auto& navigation_observer : m_navigation_observers) {
         if (navigation_observer.ongoing_navigation_changed())
             navigation_observer.ongoing_navigation_changed()->function()();
+    }
+
+    // AD-HOC: If we just finished a traversal and there are navigations that were deferred because the traversal was
+    //         ongoing, process them now.
+    // FIXME: See if this can be removed after TraversableNavigable::apply_the_history_step()'s spin_until is gone.
+    if (was_traversal && !ongoing_navigation.has<Traversal>()) {
+        while (!m_pending_navigations.is_empty()) {
+            auto navigation_params = m_pending_navigations.take_first();
+            begin_navigation(navigation_params);
+        }
     }
 }
 
@@ -1120,8 +1132,8 @@ static void create_navigation_params_by_fetching(GC::Ptr<SessionHistoryEntry> en
 
     // 4. If navigable is a top-level traversable, then set request's top-level navigation initiator origin to entry's
     //    document state's initiator origin.
-    if (navigable->top_level_traversable()->parent() == nullptr)
-        request->set_top_level_navigation_initiator_origin(entry->document_state()->origin());
+    if (navigable->is_top_level_traversable())
+        request->set_top_level_navigation_initiator_origin(entry->document_state()->initiator_origin());
 
     // 5. If request's client is null:
     if (request->client() == nullptr) {
@@ -1778,11 +1790,20 @@ void Navigable::begin_navigation(NavigateParams params)
     // 16. Let targetSnapshotParams be the result of snapshotting target snapshot params given navigable.
     [[maybe_unused]] auto target_snapshot_params = snapshot_target_snapshot_params();
 
-    // FIXME: 17. Invoke WebDriver BiDi navigation started with navigable and a new WebDriver BiDi navigation status whose id is navigationId, status is "pending", and url is url.
+    // FIXME: 17. Invoke WebDriver BiDi navigation started with navigable and a new WebDriver BiDi navigation status whose id
+    //     is navigationId, status is "pending", and url is url.
 
     // 18. If navigable's ongoing navigation is "traversal", then:
     if (ongoing_navigation().has<Traversal>()) {
-        // FIXME: 1. Invoke WebDriver BiDi navigation failed with navigable and a new WebDriver BiDi navigation status whose id is navigationId, status is "canceled", and url is url.
+        // FIXME: 1. Invoke WebDriver BiDi navigation failed with navigable and a new WebDriver BiDi navigation status whose id
+        //    is navigationId, status is "canceled", and url is url.
+
+        // AD-HOC: Instead of canceling the navigation (per spec step 18.2), defer it until the traversal completes.
+        //         This prevents a race condition where page_did_finish_loading is sent to the client before the session
+        //         history traversal from finalize_a_cross_document_navigation completes. If the client sends a new
+        //         navigation before the traversal finishes, it would be dropped, causing the page to appear stuck.
+        // FIXME: See if this can be removed after TraversableNavigable::apply_the_history_step()'s spin_until is gone.
+        m_pending_navigations.append(move(params));
 
         // 2. Return.
         return;
@@ -2449,10 +2470,8 @@ void finalize_a_cross_document_navigation(GC::Ref<Navigable> navigable, HistoryH
 
     // AD-HOC: If we're inside a navigable container, let's trigger a relayout in the container document.
     //         This allows size negotiation between the containing document and SVG documents to happen.
-    if (auto container = navigable->container()) {
-        if (auto layout_node = container->layout_node())
-            layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::FinalizeACrossDocumentNavigation);
-    }
+    if (auto container = navigable->container())
+        container->set_needs_layout_update(DOM::SetNeedsLayoutReason::FinalizeACrossDocumentNavigation);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
@@ -2563,17 +2582,27 @@ CSSPixelPoint Navigable::to_top_level_position(CSSPixelPoint a_position)
             break;
         if (!ancestor->container())
             return {};
-        if (!ancestor->container()->paintable())
+        auto const* paintable = ancestor->container()->paintable();
+        if (!paintable)
             return {};
-        // FIXME: Handle CSS transforms that might affect the ancestor.
-        position.translate_by(ancestor->container()->paintable()->box_type_agnostic_position());
+
+        if (auto const* paintable_box = as_if<Painting::PaintableBox>(*paintable); paintable_box && paintable_box->accumulated_visual_context()) {
+            auto const& accumulated_visual_context = *paintable_box->accumulated_visual_context();
+            auto const& viewport_paintable = *paintable_box->document().paintable();
+            auto const& scroll_state = viewport_paintable.scroll_state_snapshot();
+            auto point = paintable_box->absolute_position();
+            point.translate_by(position);
+            position = accumulated_visual_context.transform_rect_to_viewport({ point, { 0, 0 } }, scroll_state).location().to_type<CSSPixels>();
+        } else {
+            position.translate_by(paintable->box_type_agnostic_position());
+        }
     }
     return position;
 }
 
-void Navigable::set_viewport_size(CSSPixelSize size)
+void Navigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList invalidate_display_list)
 {
-    if (m_viewport_size == size)
+    if (m_viewport_size == size && invalidate_display_list == InvalidateDisplayList::No)
         return;
 
     m_viewport_size = size;
@@ -2588,18 +2617,37 @@ void Navigable::set_viewport_size(CSSPixelSize size)
         // NOTE: Resizing the viewport changes the reference value for viewport-relative CSS lengths.
         document->invalidate_style(DOM::StyleInvalidationReason::NavigableSetViewportSize);
         document->set_needs_media_query_evaluation();
-        if (auto layout_node = document->layout_node())
-            layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::NavigableSetViewportSize);
+        document->set_needs_layout_update(DOM::SetNeedsLayoutReason::NavigableSetViewportSize);
     }
 
     if (auto document = active_document()) {
-        document->set_needs_display(InvalidateDisplayList::No);
+        document->set_needs_repaint(Badge<HTML::Navigable> {}, invalidate_display_list);
 
         document->inform_all_viewport_clients_about_the_current_viewport_rect();
 
         // Schedule the HTML event loop to ensure that a `resize` event gets fired.
         HTML::main_thread_event_loop().schedule();
     }
+}
+
+void Navigable::clamp_viewport_scroll_offset()
+{
+    auto document = active_document();
+    if (!document || !document->layout_is_up_to_date())
+        return;
+    if (!document->paintable_box())
+        return;
+    auto scrollable_overflow_rect = document->paintable_box()->scrollable_overflow_rect();
+    if (!scrollable_overflow_rect.has_value())
+        return;
+    auto max_x = scrollable_overflow_rect->width() - m_viewport_size.width();
+    auto max_y = scrollable_overflow_rect->height() - m_viewport_size.height();
+    CSSPixelPoint clamped = {
+        max(CSSPixels(0), min(m_viewport_scroll_offset.x(), max_x)),
+        max(CSSPixels(0), min(m_viewport_scroll_offset.y(), max_y)),
+    };
+    if (clamped != m_viewport_scroll_offset)
+        perform_scroll_of_viewport_scrolling_box(clamped);
 }
 
 void Navigable::perform_scroll_of_viewport_scrolling_box(CSSPixelPoint new_position)
@@ -2612,7 +2660,7 @@ void Navigable::perform_scroll_of_viewport_scrolling_box(CSSPixelPoint new_posit
         scroll_offset_did_change();
 
         if (auto document = active_document()) {
-            document->set_needs_display(InvalidateDisplayList::No);
+            document->set_needs_repaint(Badge<HTML::Navigable> {}, InvalidateDisplayList::No);
             document->set_needs_to_refresh_scroll_state(true);
             document->inform_all_viewport_clients_about_the_current_viewport_rect();
         }
@@ -2714,6 +2762,8 @@ String Navigable::selected_text() const
     auto document = active_document();
     if (!document)
         return String {};
+
+    document->update_layout(DOM::UpdateLayoutReason::NavigableSelectedText);
 
     auto const* input_element = as_if<HTML::HTMLInputElement>(document->active_element());
     if (input_element && input_element->type_state() == HTML::HTMLInputElement::TypeAttributeState::Password) {
@@ -2923,6 +2973,9 @@ GC::Ref<WebIDL::Promise> Navigable::perform_a_scroll_of_the_viewport(CSSPixelPoi
     //     Promise returned from this step.
     TemporaryExecutionContext temporary_execution_context { doc->realm() };
 
+    // NB: Must update layout before accessing paintables.
+    doc->update_layout(DOM::UpdateLayoutReason::NavigableViewportScroll);
+
     // AD-HOC: Skip scrolling unscrollable boxes.
     if (!doc->paintable_box()->could_be_scrolled_by_wheel_event())
         return WebIDL::create_resolved_promise(doc->realm(), JS::js_undefined());
@@ -2948,9 +3001,9 @@ GC::Ref<WebIDL::Promise> Navigable::perform_a_scroll_of_the_viewport(CSSPixelPoi
     vv->scroll_by({ visual_dx, visual_dy });
     if (visual_dx != 0.0 || visual_dy != 0.0) {
         doc->set_needs_accumulated_visual_contexts_update(true);
-        doc->set_needs_display(InvalidateDisplayList::Yes);
+        doc->set_needs_repaint(Badge<HTML::Navigable> {}, InvalidateDisplayList::Yes);
     } else {
-        doc->set_needs_display(InvalidateDisplayList::No);
+        doc->set_needs_repaint(Badge<HTML::Navigable> {}, InvalidateDisplayList::No);
     }
 
     // 16. Let scrollPromise be a new Promise.

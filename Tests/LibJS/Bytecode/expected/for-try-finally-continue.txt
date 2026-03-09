@@ -1,0 +1,44 @@
+JS bytecode executable ""
+[   0]    0: GetLexicalEnvironment dst:reg4
+[   8]       SetGlobal identifier:i, src:Int32(0)
+[  20]       Mov dst:reg5, src:Undefined
+[  30]       Jump target:@80
+[  38]    1: Jump target:@198
+[  40]    2: GetGlobal dst:reg6, identifier:i
+[  58]       PostfixIncrement dst:reg7, src:reg6
+[  68]       SetGlobal identifier:i, src:reg6
+[  80]    3: GetGlobal dst:reg6, identifier:i
+[  98]       JumpLessThan lhs:reg6, rhs:Int32(5), true_target:@38, false_target:@b0
+[  b0]    4: GetGlobal dst:reg6, identifier:i
+[  c8]       StrictlyInequals dst:reg7, lhs:reg6, rhs:Int32(5)
+[  d8]       Mov dst:reg6, src:Undefined
+[  e8]       JumpIf condition:reg7, true_target:@238, false_target:@240
+[  f8]    5: Catch dst:reg7
+[ 100]       SetLexicalEnvironment environment:reg4
+[ 108]       Mov dst:reg6, src:Int32(1)
+[ 118]    6: Mov dst:reg9, src:Undefined
+[ 128]       JumpStrictlyEquals lhs:reg6, rhs:Int32(0), true_target:@1d0, false_target:@1f8
+[ 140]    7: Catch dst:reg8
+[ 148]       SetLexicalEnvironment environment:reg4
+[ 150]       Mov dst:e~0, src:reg8
+[ 160]       Mov dst:reg9, src:Undefined
+[ 170]       Mov dst:reg10, src:reg9
+[ 180]       Mov dst:reg6, src:Int32(0)
+[ 190]       Jump target:@118
+[ 198]    8: Mov dst:reg8, src:Undefined
+[ 1a8]       Mov dst:reg5, src:reg8
+[ 1b8]       Mov dst:reg6, src:Int32(3)
+[ 1c8]       Jump target:@118
+[ 1d0]    9: Mov dst:reg5, src:reg10
+[ 1e0]       Mov dst:reg5, src:reg10
+[ 1f0]       Jump target:@40
+[ 1f8]   10: JumpStrictlyEquals lhs:reg6, rhs:Int32(3), true_target:@40, false_target:@210
+[ 210]   11: JumpStrictlyEquals lhs:reg6, rhs:Int32(2), true_target:@228, false_target:@230
+[ 228]   12: Return value:reg7
+[ 230]   13: Throw src:reg7
+[ 238]   14: Throw src:String("bad")
+[ 240]   15: End value:reg6
+
+Exception handlers:
+    from  140 to  198 handler   f8
+    from  198 to  1d0 handler  140

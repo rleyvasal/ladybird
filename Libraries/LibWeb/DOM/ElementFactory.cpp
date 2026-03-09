@@ -98,6 +98,7 @@
 #include <LibWeb/SVG/SVGFEColorMatrixElement.h>
 #include <LibWeb/SVG/SVGFEComponentTransferElement.h>
 #include <LibWeb/SVG/SVGFECompositeElement.h>
+#include <LibWeb/SVG/SVGFEDisplacementMapElement.h>
 #include <LibWeb/SVG/SVGFEDropShadowElement.h>
 #include <LibWeb/SVG/SVGFEFloodElement.h>
 #include <LibWeb/SVG/SVGFEFuncAElement.h>
@@ -120,6 +121,7 @@
 #include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGMetadataElement.h>
 #include <LibWeb/SVG/SVGPathElement.h>
+#include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGPolygonElement.h>
 #include <LibWeb/SVG/SVGPolylineElement.h>
 #include <LibWeb/SVG/SVGRadialGradientElement.h>
@@ -494,6 +496,8 @@ static GC::Ref<SVG::SVGElement> create_svg_element(JS::Realm& realm, Document& d
         return realm.create<SVG::SVGFEComponentTransferElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feComposite)
         return realm.create<SVG::SVGFECompositeElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feDisplacementMap)
+        return realm.create<SVG::SVGFEDisplacementMapElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feDropShadow)
         return realm.create<SVG::SVGFEDropShadowElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feFlood)
@@ -534,6 +538,8 @@ static GC::Ref<SVG::SVGElement> create_svg_element(JS::Realm& realm, Document& d
         return realm.create<SVG::SVGMetadataElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::path)
         return realm.create<SVG::SVGPathElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::pattern)
+        return realm.create<SVG::SVGPatternElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::polygon)
         return realm.create<SVG::SVGPolygonElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::polyline)
@@ -648,10 +654,9 @@ WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, FlyStri
                 auto result = TRY(WebIDL::construct(constructor, {}));
 
                 // NOTE: IDL does not currently convert the object for us, so we will have to do it here.
-                if (!result.is_object() || !is<HTML::HTMLElement>(result.as_object()))
+                auto element = result.as_if<HTML::HTMLElement>();
+                if (!element)
                     return JS::throw_completion(JS::TypeError::create(realm, "Custom element constructor must return an object that implements HTMLElement"_string));
-
-                GC::Ref<HTML::HTMLElement> element = as<HTML::HTMLElement>(result.as_object());
 
                 // FIXME: 3. Assert: result’s custom element state and custom element definition are initialized.
 
@@ -684,7 +689,7 @@ WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, FlyStri
 
                 // 11. Set result’s is value to null.
                 element->set_is_value(Optional<String> {});
-                return element;
+                return *element;
             };
 
             auto result = synchronously_upgrade_custom_element();

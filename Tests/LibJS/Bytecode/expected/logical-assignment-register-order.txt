@@ -1,0 +1,10 @@
+JS bytecode executable ""
+[   0]    0: GetLexicalEnvironment dst:reg4
+[   8]       GetGlobal dst:reg5, identifier:value
+[  20]       JumpFalse condition:reg5, target:@78
+[  30]    1: NewFunction dst:reg6, shared_function_data_index:0, lhs_name:value
+[  48]       Mov dst:reg7, src:reg6
+[  58]       SetGlobal identifier:value, src:reg7
+[  70]       End value:reg7
+[  78]    2: Mov dst:reg7, src:reg5
+[  88]    3: End value:reg7

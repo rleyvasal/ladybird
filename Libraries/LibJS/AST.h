@@ -55,6 +55,7 @@ struct ASTDumpState {
     bool is_last { true };
     bool is_root { true };
     bool use_color { false };
+    StringBuilder* output { nullptr };
 };
 
 class JS_API ASTNode : public RefCounted<ASTNode> {
@@ -66,6 +67,7 @@ public:
 
     virtual Optional<Bytecode::ScopedOperand> generate_bytecode(Bytecode::Generator&, Optional<Bytecode::ScopedOperand> preferred_dst = {}) const;
     virtual void dump(ASTDumpState const& state = {}) const;
+    [[nodiscard]] String dump_to_string() const;
 
     [[nodiscard]] SourceRange const& source_range() const { return m_source_range; }
     u32 start_offset() const { return m_source_range.start.offset; }
@@ -1171,6 +1173,9 @@ public:
     {
     }
 
+    auto const& lhs() const { return m_lhs; }
+    auto const& rhs() const { return m_rhs; }
+
     virtual void dump(ASTDumpState const& state = {}) const override;
     virtual Optional<Bytecode::ScopedOperand> generate_bytecode(Bytecode::Generator&, Optional<Bytecode::ScopedOperand> preferred_dst = {}) const override;
 
@@ -1371,6 +1376,15 @@ public:
     {
     }
 
+    RegExpLiteral(SourceRange source_range, Utf16String pattern, Utf16String flags, regex::RegexOptions<ECMAScriptFlags> parsed_flags)
+        : Expression(move(source_range))
+        , m_parsed_regex { .bytecode = regex::ByteCode {} }
+        , m_parsed_flags(parsed_flags)
+        , m_pattern(move(pattern))
+        , m_flags(move(flags))
+    {
+    }
+
     virtual void dump(ASTDumpState const& state = {}) const override;
     virtual Optional<Bytecode::ScopedOperand> generate_bytecode(Bytecode::Generator&, Optional<Bytecode::ScopedOperand> preferred_dst = {}) const override;
 
@@ -1380,9 +1394,15 @@ public:
     Utf16String const& pattern() const { return m_pattern; }
     Utf16String const& flags() const { return m_flags; }
 
+    void set_compiled_regex(regex::Parser::Result parsed_regex, String parsed_pattern) const
+    {
+        m_parsed_regex = move(parsed_regex);
+        m_parsed_pattern = move(parsed_pattern);
+    }
+
 private:
-    regex::Parser::Result m_parsed_regex;
-    String m_parsed_pattern;
+    mutable regex::Parser::Result m_parsed_regex;
+    mutable String m_parsed_pattern;
     regex::RegexOptions<ECMAScriptFlags> m_parsed_flags;
     Utf16String m_pattern;
     Utf16String m_flags;

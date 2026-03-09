@@ -15,8 +15,10 @@
 #include <LibWeb/CSS/CalculatedOr.h>
 #include <LibWeb/CSS/Clip.h>
 #include <LibWeb/CSS/ColumnCount.h>
+#include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/Display.h>
+#include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/Filter.h>
 #include <LibWeb/CSS/GridTrackPlacement.h>
 #include <LibWeb/CSS/GridTrackSize.h>
@@ -143,7 +145,7 @@ private:
 
 using CursorData = Variant<NonnullRefPtr<CursorStyleValue const>, CursorPredefined>;
 
-using ListStyleType = Variant<Empty, CounterStyleNameKeyword, String>;
+using ListStyleType = Variant<Empty, RefPtr<CounterStyle const>, String>;
 
 class InitialValues {
 public:
@@ -184,7 +186,7 @@ public:
     static Filter filter() { return Filter::make_none(); }
     static Color background_color() { return Color::Transparent; }
     static BackgroundBox background_color_clip() { return BackgroundBox::BorderBox; }
-    static ListStyleType list_style_type() { return CounterStyleNameKeyword::Disc; }
+    static ListStyleType list_style_type() { return RefPtr<CounterStyle const> { CounterStyle::disc() }; }
     static ListStylePosition list_style_position() { return ListStylePosition::Outside; }
     static Visibility visibility() { return Visibility::Visible; }
     static FlexDirection flex_direction() { return FlexDirection::Row; }
@@ -245,7 +247,7 @@ public:
     static Variant<LengthPercentage, NormalGap> row_gap() { return NormalGap {}; }
     static BorderCollapse border_collapse() { return BorderCollapse::Separate; }
     static EmptyCells empty_cells() { return EmptyCells::Show; }
-    static Vector<Vector<String>> grid_template_areas() { return {}; }
+    static GridTemplateAreas grid_template_areas() { return {}; }
     static Time transition_delay() { return Time::make_seconds(0); }
     static ObjectFit object_fit() { return ObjectFit::Fill; }
     static Position object_position() { return {}; }
@@ -258,6 +260,7 @@ public:
     static TransformBox transform_box() { return TransformBox::ViewBox; }
     static TransformStyle transform_style() { return TransformStyle::Flat; }
     static Direction direction() { return Direction::Ltr; }
+    static Optional<BaselineMetric> dominant_baseline() { return {}; }
     static UnicodeBidi unicode_bidi() { return UnicodeBidi::Normal; }
     static WritingMode writing_mode() { return WritingMode::HorizontalTb; }
     static UserSelect user_select() { return UserSelect::Auto; }
@@ -308,8 +311,9 @@ public:
         : m_value(color)
     {
     }
-    SVGPaint(URL const& url)
+    SVGPaint(URL const& url, Optional<Color> fallback_color = {})
         : m_value(url)
+        , m_fallback_color(fallback_color)
     {
     }
 
@@ -317,9 +321,11 @@ public:
     bool is_url() const { return m_value.has<URL>(); }
     Color as_color() const { return m_value.get<Color>(); }
     URL const& as_url() const { return m_value.get<URL>(); }
+    Optional<Color> const& fallback_color() const { return m_fallback_color; }
 
 private:
     Variant<URL, Color> m_value;
+    Optional<Color> m_fallback_color;
 };
 
 // https://drafts.fxtf.org/css-masking-1/#typedef-mask-reference
@@ -588,10 +594,11 @@ public:
     Variant<LengthPercentage, NormalGap> const& row_gap() const { return m_noninherited.row_gap; }
     BorderCollapse border_collapse() const { return m_inherited.border_collapse; }
     EmptyCells empty_cells() const { return m_inherited.empty_cells; }
-    Vector<Vector<String>> const& grid_template_areas() const { return m_noninherited.grid_template_areas; }
+    GridTemplateAreas const& grid_template_areas() const { return m_noninherited.grid_template_areas; }
     ObjectFit object_fit() const { return m_noninherited.object_fit; }
     Position object_position() const { return m_noninherited.object_position; }
     Direction direction() const { return m_inherited.direction; }
+    Optional<BaselineMetric> dominant_baseline() const { return m_inherited.dominant_baseline; }
     UnicodeBidi unicode_bidi() const { return m_noninherited.unicode_bidi; }
     WritingMode writing_mode() const { return m_inherited.writing_mode; }
     UserSelect user_select() const { return m_noninherited.user_select; }
@@ -629,7 +636,7 @@ public:
 
     Color webkit_text_fill_color() const { return m_inherited.webkit_text_fill_color; }
 
-    ListStyleType list_style_type() const { return m_inherited.list_style_type; }
+    ListStyleType const& list_style_type() const { return m_inherited.list_style_type; }
     ListStylePosition list_style_position() const { return m_inherited.list_style_position; }
 
     Optional<SVGPaint> const& fill() const { return m_inherited.fill; }
@@ -747,6 +754,7 @@ protected:
         ListStyleType list_style_type { InitialValues::list_style_type() };
         QuotesData quotes { InitialValues::quotes() };
         Direction direction { InitialValues::direction() };
+        Optional<BaselineMetric> dominant_baseline { InitialValues::dominant_baseline() };
         WritingMode writing_mode { InitialValues::writing_mode() };
         FillRule fill_rule { InitialValues::fill_rule() };
         StrokeLinecap stroke_linecap { InitialValues::stroke_linecap() };
@@ -853,7 +861,7 @@ protected:
         Size column_width { InitialValues::column_width() };
         Size column_height { InitialValues::column_height() };
         Variant<LengthPercentage, NormalGap> row_gap { InitialValues::row_gap() };
-        Vector<Vector<String>> grid_template_areas { InitialValues::grid_template_areas() };
+        GridTemplateAreas grid_template_areas { InitialValues::grid_template_areas() };
         Gfx::Color stop_color { InitialValues::stop_color() };
         float stop_opacity { InitialValues::stop_opacity() };
         Time transition_delay { InitialValues::transition_delay() };
@@ -1068,7 +1076,7 @@ public:
     void set_row_gap(Variant<LengthPercentage, NormalGap> const& row_gap) { m_noninherited.row_gap = row_gap; }
     void set_border_collapse(BorderCollapse const border_collapse) { m_inherited.border_collapse = border_collapse; }
     void set_empty_cells(EmptyCells const empty_cells) { m_inherited.empty_cells = empty_cells; }
-    void set_grid_template_areas(Vector<Vector<String>> const& grid_template_areas) { m_noninherited.grid_template_areas = grid_template_areas; }
+    void set_grid_template_areas(GridTemplateAreas grid_template_areas) { m_noninherited.grid_template_areas = move(grid_template_areas); }
     void set_grid_auto_flow(GridAutoFlow grid_auto_flow) { m_noninherited.grid_auto_flow = grid_auto_flow; }
     void set_transition_delay(Time const& transition_delay) { m_noninherited.transition_delay = transition_delay; }
     void set_table_layout(TableLayout value) { m_noninherited.table_layout = value; }
@@ -1076,6 +1084,7 @@ public:
     void set_object_fit(ObjectFit value) { m_noninherited.object_fit = value; }
     void set_object_position(Position value) { m_noninherited.object_position = move(value); }
     void set_direction(Direction value) { m_inherited.direction = value; }
+    void set_dominant_baseline(Optional<BaselineMetric> value) { m_inherited.dominant_baseline = value; }
     void set_unicode_bidi(UnicodeBidi value) { m_noninherited.unicode_bidi = value; }
     void set_writing_mode(WritingMode value) { m_inherited.writing_mode = value; }
     void set_user_select(UserSelect value) { m_noninherited.user_select = value; }

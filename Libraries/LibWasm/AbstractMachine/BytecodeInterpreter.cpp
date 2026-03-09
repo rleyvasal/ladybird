@@ -2013,8 +2013,6 @@ HANDLE_INSTRUCTION(call_indirect)
     auto address = element.ref().template get<Reference::Func>().address;
     auto const& type_actual = configuration.store().get(address)->visit([](auto& f) -> decltype(auto) { return f.type(); });
     auto const& type_expected = configuration.frame().module().types()[args.type.value()].unsafe_function();
-    TRAP_IN_LOOP_IF_NOT(type_actual.parameters().size() == type_expected.parameters().size());
-    TRAP_IN_LOOP_IF_NOT(type_actual.results().size() == type_expected.results().size());
     TRAP_IN_LOOP_IF_NOT(type_actual.parameters() == type_expected.parameters());
     TRAP_IN_LOOP_IF_NOT(type_actual.results() == type_expected.results());
 
@@ -2040,8 +2038,6 @@ HANDLE_INSTRUCTION(return_call_indirect)
     auto address = element.ref().template get<Reference::Func>().address;
     auto const& type_actual = configuration.store().get(address)->visit([](auto& f) -> decltype(auto) { return f.type(); });
     auto const& type_expected = configuration.frame().module().types()[args.type.value()].unsafe_function();
-    TRAP_IN_LOOP_IF_NOT(type_actual.parameters().size() == type_expected.parameters().size());
-    TRAP_IN_LOOP_IF_NOT(type_actual.results().size() == type_expected.results().size());
     TRAP_IN_LOOP_IF_NOT(type_actual.parameters() == type_expected.parameters());
     TRAP_IN_LOOP_IF_NOT(type_actual.results() == type_expected.results());
 
@@ -2050,6 +2046,62 @@ HANDLE_INSTRUCTION(return_call_indirect)
     switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::IndirectTailCall)) {
     default:
         // Some IP we have to continue from.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        addresses = { .sources_and_destination = default_sources_and_destination };
+        cc = configuration.frame().expression().compiled_instructions.dispatches.data();
+        addresses_ptr = configuration.frame().expression().compiled_instructions.src_dst_mappings.data();
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    case Outcome::Return:
+        return Outcome::Return;
+    }
+}
+
+HANDLE_INSTRUCTION(call_ref)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto type_index = instruction->arguments().get<TypeIndex>();
+    FunctionAddress address;
+    {
+        auto value = configuration.take_source<source_address_mix>(0, addresses.sources);
+        auto reference = value.template to<Reference>();
+        TRAP_IN_LOOP_IF_NOT(!reference.ref().template has<Reference::Null>());
+        address = reference.ref().template get<Reference::Func>().address;
+    }
+    auto const& type_actual = configuration.store().get(address)->visit([](auto& f) -> decltype(auto) { return f.type(); });
+    auto const& type_expected = configuration.frame().module().types()[type_index.value()].unsafe_function();
+    TRAP_IN_LOOP_IF_NOT(type_actual.parameters() == type_expected.parameters());
+    TRAP_IN_LOOP_IF_NOT(type_actual.results() == type_expected.results());
+
+    dbgln_if(WASM_TRACE_DEBUG, "call_ref({})", address.value());
+    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::IndirectCall) == Outcome::Return)
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(return_call_ref)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto type_index = instruction->arguments().get<TypeIndex>();
+    FunctionAddress address;
+    {
+        auto value = configuration.take_source<source_address_mix>(0, addresses.sources);
+        auto reference = value.template to<Reference>();
+        TRAP_IN_LOOP_IF_NOT(!reference.ref().template has<Reference::Null>());
+        address = reference.ref().template get<Reference::Func>().address;
+    }
+    auto const& type_actual = configuration.store().get(address)->visit([](auto& f) -> decltype(auto) { return f.type(); });
+    auto const& type_expected = configuration.frame().module().types()[type_index.value()].unsafe_function();
+    TRAP_IN_LOOP_IF_NOT(type_actual.parameters() == type_expected.parameters());
+    TRAP_IN_LOOP_IF_NOT(type_actual.results() == type_expected.results());
+
+    configuration.label_stack().shrink(configuration.frame().label_index(), true);
+    dbgln_if(WASM_TRACE_DEBUG, "tail call_ref({})", address.value());
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::IndirectTailCall)) {
+    default:
         short_ip.current_ip_value = to_underlying(outcome) - 1;
         addresses = { .sources_and_destination = default_sources_and_destination };
         cc = configuration.frame().expression().compiled_instructions.dispatches.data();
@@ -5101,7 +5153,7 @@ FLATTEN void BytecodeInterpreter::interpret_impl(Configuration& configuration, E
         if (outcome == Outcome::Return)                                                                                                                                                  \
             return;                                                                                                                                                                      \
         short_ip.current_ip_value = to_underlying(outcome);                                                                                                                              \
-        if constexpr (Instructions::name == Instructions::return_call || Instructions::name == Instructions::return_call_indirect) {                                                     \
+        if constexpr (first_is_one_of(Instructions::name, Instructions::return_call, Instructions::return_call_indirect, Instructions::return_call_ref)) {                               \
             cc = configuration.frame().expression().compiled_instructions.dispatches.data();                                                                                             \
             addresses_ptr = configuration.frame().expression().compiled_instructions.src_dst_mappings.data();                                                                            \
         }                                                                                                                                                                                \
@@ -5822,7 +5874,6 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
                 i32_const_value = instruction.arguments().get<i32>();
                 pattern_state = InsnPatternState::GetLocalI32Const;
             } else if (instruction.opcode() == Instructions::local_get) {
-                swap(local_index_0, local_index_1);
                 local_index_1 = instruction.local_index();
                 pattern_state = InsnPatternState::GetLocalx2;
             } else if (instruction.opcode() == Instructions::i32_add) {
@@ -5838,9 +5889,8 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
                 set_default_dispatch(result.extra_instruction_storage.unsafe_last());
                 pattern_state = InsnPatternState::Nothing;
                 continue;
-            }
-            if (instruction.opcode() == Instructions::i32_and) {
-                // `i32.const a; local.get b; i32.add` -> `i32.and_constlocal b a`.
+            } else if (instruction.opcode() == Instructions::i32_and) {
+                // `i32.const a; local.get b; i32.and` -> `i32.and_constlocal b a`.
                 // Replace the previous two ops with noops, and add i32.and_constlocal.
                 set_default_dispatch(nop, result.dispatches.size() - 1);
                 set_default_dispatch(nop, result.dispatches.size() - 2);
@@ -5852,8 +5902,9 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
                 set_default_dispatch(result.extra_instruction_storage.unsafe_last());
                 pattern_state = InsnPatternState::Nothing;
                 continue;
+            } else {
+                pattern_state = InsnPatternState::Nothing;
             }
-            pattern_state = InsnPatternState::Nothing;
             break;
         case InsnPatternState::I64Const:
             if (instruction.opcode() == Instructions::local_get) {
@@ -5903,7 +5954,6 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
                 i64_const_value = instruction.arguments().get<i64>();
                 pattern_state = InsnPatternState::GetLocalI64Const;
             } else if (instruction.opcode() == Instructions::local_get) {
-                swap(local_index_0, local_index_1);
                 local_index_1 = instruction.local_index();
                 pattern_state = InsnPatternState::GetLocalx2;
             } else if (instruction.opcode() == Instructions::i64_add) {
@@ -6767,7 +6817,7 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
                     warnln("       dest [{}]", regname(dest));
                 } else if (out_count > 1) {
                     warnln("       dest [multiple outputs]");
-                } else if (instruction->opcode() == Instructions::call || instruction->opcode() == Instructions::call_indirect) {
+                } else if (first_is_one_of(instruction->opcode(), Instructions::call, Instructions::call_indirect, Instructions::call_ref)) {
                     if (addresses.destination != Dispatch::Stack)
                         warnln("       dest [{}]", regname(addresses.destination));
                 }
@@ -6852,7 +6902,7 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
             used[to_underlying(src)] = false;
         }
         // if the instruction has an output, ensure it's not writing to a register that is marked used.
-        if (out_count == 1 || dispatch.instruction->opcode() == Instructions::call || dispatch.instruction->opcode() == Instructions::call_indirect) {
+        if (out_count == 1 || first_is_one_of(dispatch.instruction->opcode(), Instructions::call, Instructions::call_indirect, Instructions::call_ref)) {
             auto dest = addr.destination;
             if (dest != Dispatch::Stack) {
                 if (used[to_underlying(dest)]) {

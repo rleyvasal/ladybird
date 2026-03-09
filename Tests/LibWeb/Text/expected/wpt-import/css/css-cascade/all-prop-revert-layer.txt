@@ -1,9 +1,9 @@
 Harness status: OK
 
-Found 285 tests
+Found 286 tests
 
-280 Pass
-5 Fail
+282 Pass
+4 Fail
 Pass	accent-color
 Pass	border-collapse
 Pass	border-spacing
@@ -15,6 +15,7 @@ Pass	color-interpolation
 Pass	color-scheme
 Pass	cursor
 Pass	direction
+Pass	dominant-baseline
 Pass	empty-cells
 Pass	fill
 Pass	fill-opacity
@@ -159,7 +160,7 @@ Pass	counter-set
 Pass	cx
 Pass	cy
 Pass	display
-Fail	filter
+Pass	filter
 Pass	flex-basis
 Pass	flex-direction
 Pass	flex-grow

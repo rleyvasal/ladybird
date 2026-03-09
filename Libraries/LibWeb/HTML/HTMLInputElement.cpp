@@ -8,6 +8,7 @@
  * Copyright (c) 2024, Fernando Kiotheka <fer@k6a.dev>
  * Copyright (c) 2025, Felipe Muñoz Mazur <felipe.munoz.mazur@protonmail.com>
  * Copyright (c) 2025, Glenn Skrzypczak <glenn.skrzypczak@gmail.com>
+ * Copyright (c) 2026, Michiel Nijenhuis <michielmitsjol@gmail.com>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -20,6 +21,7 @@
 #include <LibWeb/Bindings/HTMLInputElementPrototype.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
+#include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
@@ -210,8 +212,7 @@ void HTMLInputElement::set_checked(bool checked)
         },
         {});
 
-    if (auto* paintable = this->paintable())
-        paintable->set_needs_display();
+    set_needs_repaint();
 }
 
 void HTMLInputElement::set_checked_binding(bool checked)
@@ -861,7 +862,10 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
         style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
         style->set_declarations_from_text(R"~~~(
                 width: 100%;
+                height: 1lh;
                 align-items: center;
+                overflow: hidden;
+                scrollbar-width: none;
                 text-overflow: clip;
                 white-space: nowrap;
             )~~~"sv);
@@ -2348,7 +2352,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_size(WebIDL::UnsignedLong value)
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-height
 WebIDL::UnsignedLong HTMLInputElement::height() const
 {
-    const_cast<DOM::Document&>(document()).update_layout(DOM::UpdateLayoutReason::HTMLInputElementHeight);
+    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLInputElementHeight);
 
     // When the input element's type attribute is not in the Image Button state, then no image is available.
     if (type_state() != TypeAttributeState::ImageButton)
@@ -2383,7 +2387,7 @@ void HTMLInputElement::set_height(WebIDL::UnsignedLong value)
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-width
 WebIDL::UnsignedLong HTMLInputElement::width() const
 {
-    const_cast<DOM::Document&>(document()).update_layout(DOM::UpdateLayoutReason::HTMLInputElementWidth);
+    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLInputElementWidth);
 
     // When the input element's type attribute is not in the Image Button state, then no image is available.
     if (type_state() != TypeAttributeState::ImageButton)

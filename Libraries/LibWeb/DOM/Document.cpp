@@ -5,6 +5,7 @@
  * Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
  * Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+ * Copyright (c) 2025, Simon Farre <simon.farre.cx@gmail.com>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -42,11 +43,14 @@
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/CSS/AnimationEvent.h>
 #include <LibWeb/CSS/CSSAnimation.h>
+#include <LibWeb/CSS/CSSCounterStyleRule.h>
 #include <LibWeb/CSS/CSSImportRule.h>
 #include <LibWeb/CSS/CSSPropertyRule.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/CounterStyle.h>
+#include <LibWeb/CSS/CounterStyleDefinition.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/MediaQueryList.h>
@@ -178,10 +182,12 @@
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
+#include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/PermissionsPolicy/AutoplayAllowlist.h>
+#include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
@@ -496,6 +502,7 @@ Document::Document(JS::Realm& realm, URL::URL const& url, TemporaryDocumentForFr
     , m_style_computer(realm.heap().allocate<CSS::StyleComputer>(*this))
     , m_font_computer(realm.heap().allocate<CSS::FontComputer>(*this))
     , m_url(url)
+    , m_fonts(CSS::FontFaceSet::create(realm))
     , m_temporary_document_for_fragment_parsing(temporary_document_for_fragment_parsing)
     , m_editing_host_manager(EditingHostManager::create(realm, *this))
     , m_dynamic_view_transition_style_sheet(parse_css_stylesheet(CSS::Parser::ParsingParams(realm), ""sv, {}))
@@ -517,11 +524,9 @@ Document::Document(JS::Realm& realm, URL::URL const& url, TemporaryDocumentForFr
             return;
 
         auto node = cursor_position->node();
-        node->document().update_layout(UpdateLayoutReason::CursorBlinkTimer);
-
-        if (node->paintable()) {
+        if (node->unsafe_paintable()) {
             m_cursor_blink_state = !m_cursor_blink_state;
-            node->paintable()->set_needs_display();
+            node->set_needs_repaint();
         }
     });
 
@@ -645,6 +650,10 @@ void Document::visit_edges(Cell::Visitor& visitor)
         visitor.visit(event.event);
         visitor.visit(event.animation);
         visitor.visit(event.target);
+    }
+
+    for (auto& event : m_pending_fullscreen_events) {
+        visitor.visit(event.element);
     }
 
     visitor.visit(m_adopted_style_sheets);
@@ -1155,15 +1164,16 @@ void Document::tear_down_layout_tree()
 Color Document::background_color() const
 {
     // CSS2 says we should use the HTML element's background color unless it's transparent...
-    if (auto* html_element = this->html_element(); html_element && html_element->layout_node()) {
-        auto color = html_element->layout_node()->computed_values().background_color();
+    // NB: Called during painting inside update_layout().
+    if (auto* html_element = this->html_element(); html_element && html_element->unsafe_layout_node()) {
+        auto color = html_element->unsafe_layout_node()->computed_values().background_color();
         if (color.alpha())
             return color;
     }
 
     // ...in which case we use the BODY element's background color.
-    if (auto* body_element = body(); body_element && body_element->layout_node()) {
-        auto color = body_element->layout_node()->computed_values().background_color();
+    if (auto* body_element = body(); body_element && body_element->unsafe_layout_node()) {
+        auto color = body_element->unsafe_layout_node()->computed_values().background_color();
         return color;
     }
 
@@ -1178,7 +1188,8 @@ Vector<CSS::BackgroundLayerData> const* Document::background_layers() const
     if (!body_element)
         return {};
 
-    auto body_layout_node = body_element->layout_node();
+    // NB: Called during painting inside update_layout().
+    auto body_layout_node = body_element->unsafe_layout_node();
     if (!body_layout_node)
         return {};
 
@@ -1191,7 +1202,8 @@ CSS::ImageRendering Document::background_image_rendering() const
     if (!body_element)
         return CSS::ImageRendering::Auto;
 
-    auto body_layout_node = body_element->layout_node();
+    // NB: Called during painting inside update_layout().
+    auto body_layout_node = body_element->unsafe_layout_node();
     if (!body_layout_node)
         return CSS::ImageRendering::Auto;
 
@@ -1347,41 +1359,26 @@ void Document::mark_svg_root_as_needing_relayout(Layout::SVGSVGBox& svg_root)
 
 static void relayout_svg_root(Layout::SVGSVGBox& svg_root)
 {
-    Layout::LayoutState layout_state;
-    layout_state.set_subtree_root(svg_root);
+    Layout::LayoutState layout_state(svg_root);
 
     // Pre-populate the svg_root itself.
     if (auto const* paintable = svg_root.paintable_box())
         layout_state.populate_from_paintable(svg_root, *paintable);
 
-    // Pre-populate ancestors outside the subtree:
-    // - SVGGraphicsBox ancestors (up to outer SVG) for get_parent_svg_transform()
-    // - Abspos boxes inside the subtree whose layout is managed by ancestor formatting contexts (not re-laid-out
-    //   during SVG relayout, so their existing paintable state must be preserved)
-    bool found_outer_svg = false;
+    // Pre-populate SVGGraphicsBox ancestors (up to outer SVG) for get_parent_svg_transform().
     for (auto* ancestor = svg_root.parent(); ancestor; ancestor = ancestor->parent()) {
-        if (!found_outer_svg) {
-            if (auto const* svg_graphics_ancestor = as_if<Layout::SVGGraphicsBox>(*ancestor)) {
-                if (auto const* paintable = svg_graphics_ancestor->paintable_box())
-                    layout_state.populate_from_paintable(*svg_graphics_ancestor, *paintable);
-            }
-            if (is<Layout::SVGSVGBox>(*ancestor))
-                found_outer_svg = true;
+        if (auto const* svg_graphics_ancestor = as_if<Layout::SVGGraphicsBox>(*ancestor)) {
+            if (auto const* paintable = svg_graphics_ancestor->paintable_box())
+                layout_state.populate_from_paintable(*svg_graphics_ancestor, *paintable);
         }
-
-        if (auto const* box = as_if<Layout::Box>(*ancestor)) {
-            // Pre-populate abspos boxes that are inside the SVG subtree but whose containing block is outside it.
-            // These boxes are laid out by ancestor formatting contexts (not during SVG relayout), so we must preserve
-            // their existing paintable state to prevent commit() from destroying their paintables.
-            for (auto const& abspos_child : box->contained_abspos_children()) {
-                if (svg_root.is_inclusive_ancestor_of(abspos_child) && is<Layout::Box>(*abspos_child)) {
-                    auto const& abspos_box = static_cast<Layout::Box const&>(*abspos_child);
-                    if (auto const* abspos_paintable = abspos_box.paintable_box())
-                        layout_state.populate_from_paintable(abspos_box, *abspos_paintable);
-                }
-            }
-        }
+        if (is<Layout::SVGSVGBox>(*ancestor))
+            break;
     }
+
+    // Pre-populate the viewport for position:fixed elements inside <foreignObject>.
+    auto& viewport = svg_root.root();
+    if (auto const* paintable = viewport.paintable_box())
+        layout_state.populate_from_paintable(viewport, *paintable);
 
     auto const& svg_state = layout_state.get(svg_root);
     auto content_width = svg_state.content_width();
@@ -1402,7 +1399,8 @@ static void propagate_scrollbar_width_to_viewport(Element& root_element, Layout:
     // https://drafts.csswg.org/css-scrollbars/#scrollbar-width
     // UAs must apply the scrollbar-color value set on the root element to the viewport.
     auto& viewport_computed_values = viewport.mutable_computed_values();
-    auto& root_element_computed_values = root_element.layout_node()->computed_values();
+    // NB: Called during layout tree construction.
+    auto& root_element_computed_values = root_element.unsafe_layout_node()->computed_values();
     viewport_computed_values.set_scrollbar_width(root_element_computed_values.scrollbar_width());
 }
 
@@ -1423,7 +1421,8 @@ static void propagate_overflow_to_viewport(Element& root_element, Layout::Viewpo
 
     // UAs must apply the overflow-* values set on the root element to the viewport
     // when the root element’s display value is not none.
-    auto overflow_origin_node = root_element.layout_node();
+    // NB: Called during layout tree construction.
+    auto overflow_origin_node = root_element.unsafe_layout_node();
     auto& viewport_computed_values = viewport.mutable_computed_values();
 
     // However, when the root element is an [HTML] html element (including XML syntax for HTML)
@@ -1431,12 +1430,12 @@ static void propagate_overflow_to_viewport(Element& root_element, Layout::Viewpo
     // a body element whose display value is also not none,
     // user agents must instead apply the overflow-* values of the first such child element to the viewport.
     if (root_element.is_html_html_element()) {
-        auto root_element_layout_node = root_element.layout_node();
+        auto root_element_layout_node = root_element.unsafe_layout_node();
         auto& root_element_computed_values = root_element_layout_node->mutable_computed_values();
         if (root_element_computed_values.overflow_x() == CSS::Overflow::Visible && root_element_computed_values.overflow_y() == CSS::Overflow::Visible) {
             auto* body_element = root_element.first_child_of_type<HTML::HTMLBodyElement>();
-            if (body_element && body_element->layout_node())
-                overflow_origin_node = body_element->layout_node();
+            if (body_element && body_element->unsafe_layout_node())
+                overflow_origin_node = body_element->unsafe_layout_node();
         }
     }
 
@@ -1463,35 +1462,46 @@ static void propagate_overflow_to_viewport(Element& root_element, Layout::Viewpo
     overflow_origin_computed_values.set_overflow_y(CSS::Overflow::Visible);
 }
 
+void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutReason reason)
+{
+    if (node.is_connected())
+        update_layout(reason);
+}
+
 void Document::update_layout(UpdateLayoutReason reason)
 {
     auto navigable = this->navigable();
     if (!navigable || navigable->active_document() != this)
         return;
 
+    VERIFY(!m_is_running_update_layout);
+    ScopeGuard guard = [&] { m_is_running_update_layout = false; };
+    m_is_running_update_layout = true;
+
     update_style();
 
-    auto const needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
+    if (layout_is_up_to_date())
+        return;
 
     auto svg_roots_to_relayout = move(m_svg_roots_needing_relayout);
-
-    if (m_layout_root && !m_layout_root->needs_layout_update() && svg_roots_to_relayout.is_empty())
-        return;
 
     // NOTE: If this is a document hosting <template> contents, layout is unnecessary.
     if (m_created_for_appropriate_template_contents)
         return;
+
+    auto const needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
 
     // Partial SVG relayout
     if (!needs_layout_tree_rebuild && !svg_roots_to_relayout.is_empty() && !m_layout_root->needs_layout_update()) {
         for (auto const& svg_root : svg_roots_to_relayout)
             relayout_svg_root(*svg_root);
 
+        invalidate_stacking_context_tree();
         invalidate_display_list();
-        set_needs_to_resolve_paint_only_properties();
+
         set_needs_accumulated_visual_contexts_update(true);
         update_paint_and_hit_testing_properties_if_needed();
-        m_document->set_needs_display();
+        m_document->set_needs_repaint();
         return;
     }
 
@@ -1510,7 +1520,8 @@ void Document::update_layout(UpdateLayoutReason reason)
         Layout::TreeBuilder tree_builder;
         m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
 
-        if (document_element && document_element->layout_node()) {
+        // NB: Called during layout update.
+        if (document_element && document_element->unsafe_layout_node()) {
             propagate_overflow_to_viewport(*document_element, *m_layout_root);
             propagate_scrollbar_width_to_viewport(*document_element, *m_layout_root);
         }
@@ -1522,7 +1533,11 @@ void Document::update_layout(UpdateLayoutReason reason)
         }
     }
 
+    u32 layout_index_counter = 0;
     m_layout_root->for_each_in_inclusive_subtree([&](auto& layout_node) {
+        if (auto* node_with_style = as_if<Layout::NodeWithStyle>(layout_node))
+            node_with_style->set_layout_index(layout_index_counter++);
+
         layout_node.recompute_containing_block({});
 
         auto* box = as_if<Layout::Box>(layout_node);
@@ -1551,6 +1566,7 @@ void Document::update_layout(UpdateLayoutReason reason)
     });
 
     Layout::LayoutState layout_state;
+    layout_state.ensure_capacity(layout_index_counter);
 
     {
         Layout::BlockFormattingContext root_formatting_context(layout_state, Layout::LayoutMode::Normal, *m_layout_root, nullptr);
@@ -1560,8 +1576,9 @@ void Document::update_layout(UpdateLayoutReason reason)
         viewport_state.set_content_width(viewport_rect.width());
         viewport_state.set_content_height(viewport_rect.height());
 
-        if (document_element && document_element->layout_node()) {
-            auto& icb_state = layout_state.get_mutable(as<Layout::NodeWithStyleAndBoxModelMetrics>(*document_element->layout_node()));
+        // NB: Called during layout update.
+        if (document_element && document_element->unsafe_layout_node()) {
+            auto& icb_state = layout_state.get_mutable(as<Layout::NodeWithStyleAndBoxModelMetrics>(*document_element->unsafe_layout_node()));
             icb_state.set_content_width(viewport_rect.width());
         }
 
@@ -1576,21 +1593,21 @@ void Document::update_layout(UpdateLayoutReason reason)
     // Broadcast the current viewport rect to any new paintables, so they know whether they're visible or not.
     inform_all_viewport_clients_about_the_current_viewport_rect();
 
-    m_document->set_needs_display();
-    set_needs_to_resolve_paint_only_properties();
+    m_document->set_needs_repaint();
 
-    paintable()->assign_scroll_frames();
+    // NB: Called during layout update.
+    unsafe_paintable()->assign_scroll_frames();
 
     set_needs_accumulated_visual_contexts_update(true);
     update_paint_and_hit_testing_properties_if_needed();
 
     if (auto range = get_selection()->range()) {
-        paintable()->recompute_selection_states(*range);
+        unsafe_paintable()->recompute_selection_states(*range);
     }
 
     // Collect elements with content-visibility: auto. This is used in the HTML event loop to avoid traversing the whole tree every time.
     Vector<GC::Ref<Painting::PaintableBox>> paintable_boxes_with_auto_content_visibility;
-    paintable()->for_each_in_subtree_of_type<Painting::PaintableBox>([&](auto& paintable_box) {
+    unsafe_paintable()->for_each_in_subtree_of_type<Painting::PaintableBox>([&](auto& paintable_box) {
         if (paintable_box.dom_node()
             && paintable_box.dom_node()->is_element()
             && paintable_box.computed_values().content_visibility() == CSS::ContentVisibility::Auto) {
@@ -1598,21 +1615,31 @@ void Document::update_layout(UpdateLayoutReason reason)
         }
         return TraversalDecision::Continue;
     });
-    paintable()->set_paintable_boxes_with_auto_content_visibility(move(paintable_boxes_with_auto_content_visibility));
+    unsafe_paintable()->set_paintable_boxes_with_auto_content_visibility(move(paintable_boxes_with_auto_content_visibility));
 
     m_layout_root->for_each_in_inclusive_subtree([](auto& node) {
         node.reset_needs_layout_update();
         return TraversalDecision::Continue;
     });
 
-    // Scrolling by zero offset will clamp scroll offset back to valid range if it was out of bounds
-    // after the viewport size change.
-    if (auto window = this->window())
-        window->scroll_by(0, 0);
-
     if constexpr (UPDATE_LAYOUT_DEBUG) {
         dbgln("LAYOUT {} {} µs", to_string(reason), timer.elapsed_time().to_microseconds());
     }
+
+    VERIFY(layout_is_up_to_date());
+}
+
+bool Document::layout_is_up_to_date() const
+{
+    if (!navigable() || navigable()->active_document() != this)
+        return true;
+    if (!m_layout_root)
+        return false;
+    return !m_layout_root->needs_layout_update()
+        && !needs_layout_tree_update()
+        && !child_needs_layout_tree_update()
+        && !needs_full_layout_tree_update()
+        && m_svg_roots_needing_relayout.is_empty();
 }
 
 [[nodiscard]] static CSS::RequiredInvalidationAfterStyleChange update_style_recursively(Node& node, CSS::StyleComputer& style_computer, bool needs_inherited_style_update, bool recompute_elements_depending_on_custom_properties, bool parent_display_changed)
@@ -1654,9 +1681,8 @@ void Document::update_layout(UpdateLayoutReason reason)
             }
         }
     }
-    if (node_invalidation.relayout && node.layout_node()) {
-        node.layout_node()->set_needs_layout_update(SetNeedsLayoutReason::StyleChange);
-    }
+    if (node_invalidation.relayout)
+        node.set_needs_layout_update(SetNeedsLayoutReason::StyleChange);
     if (node_invalidation.rebuild_layout_tree) {
         // We mark layout tree for rebuild starting from parent element to correctly invalidate
         // "display" property change to/from "contents" value.
@@ -1749,6 +1775,9 @@ void Document::update_style()
 
     build_registered_properties_cache();
 
+    // FIXME: We don't need to rebuild this cache on every style update, just if a @counter-style rule has changed.
+    build_counter_style_cache();
+
     auto invalidation = update_style_recursively(*this, style_computer(), false, false, false);
     if (!invalidation.is_none())
         invalidate_display_list();
@@ -1759,6 +1788,12 @@ void Document::update_style()
     if (invalidation.rebuild_stacking_context_tree)
         invalidate_stacking_context_tree();
     m_needs_full_style_update = false;
+}
+
+void Document::update_style_if_needed_for_element(AbstractElement const& abstract_element)
+{
+    if (element_needs_style_update(abstract_element))
+        update_style();
 }
 
 bool Document::element_needs_style_update(AbstractElement const& abstract_element) const
@@ -1803,9 +1838,9 @@ void Document::update_animated_style_if_needed()
 
     for (auto& timeline : m_associated_animation_timelines) {
         for (auto& animation : timeline->associated_animations()) {
-            if (animation->is_idle())
+            if (animation.is_idle())
                 continue;
-            if (auto effect = animation->effect())
+            if (auto effect = animation.effect())
                 effect->update_computed_properties(context);
         }
     }
@@ -1815,20 +1850,14 @@ void Document::update_animated_style_if_needed()
 
 void Document::update_paint_and_hit_testing_properties_if_needed()
 {
-    if (auto* paintable = this->paintable()) {
+    // NB: Called during paint property resolution.
+    if (auto* paintable = this->unsafe_paintable()) {
         paintable->refresh_scroll_state();
-    }
-
-    if (m_needs_to_resolve_paint_only_properties) {
-        m_needs_to_resolve_paint_only_properties = false;
-        if (auto* paintable = this->paintable()) {
-            paintable->resolve_paint_only_properties();
-        }
     }
 
     if (m_needs_accumulated_visual_contexts_update) {
         m_needs_accumulated_visual_contexts_update = false;
-        if (auto* paintable = this->paintable()) {
+        if (auto* paintable = this->unsafe_paintable()) {
             paintable->assign_accumulated_visual_contexts();
         }
     }
@@ -1917,8 +1946,9 @@ void Document::obtain_theme_color()
             // 4. If color is not failure, then return color.
             if (!css_value.is_null() && css_value->has_color()) {
                 CSS::ColorResolutionContext color_resolution_context {};
-                if (html_element() && html_element()->layout_node()) {
-                    color_resolution_context = CSS::ColorResolutionContext::for_layout_node_with_style(*html_element()->layout_node());
+                // NB: Called during theme color computation, layout may be stale.
+                if (html_element() && html_element()->unsafe_layout_node()) {
+                    color_resolution_context = CSS::ColorResolutionContext::for_layout_node_with_style(*html_element()->unsafe_layout_node());
                 }
 
                 theme_color = css_value->to_color(color_resolution_context).value();
@@ -1943,6 +1973,16 @@ Layout::Viewport* Document::layout_node()
     return static_cast<Layout::Viewport*>(Node::layout_node());
 }
 
+Layout::Viewport const* Document::unsafe_layout_node() const
+{
+    return static_cast<Layout::Viewport const*>(Node::unsafe_layout_node());
+}
+
+Layout::Viewport* Document::unsafe_layout_node()
+{
+    return static_cast<Layout::Viewport*>(Node::unsafe_layout_node());
+}
+
 void Document::set_inspected_node(GC::Ptr<Node> node)
 {
     m_inspected_node = node;
@@ -1954,13 +1994,13 @@ void Document::set_highlighted_node(GC::Ptr<Node> node, Optional<CSS::PseudoElem
         return;
 
     if (auto layout_node = highlighted_layout_node(); layout_node && layout_node->first_paintable())
-        layout_node->first_paintable()->set_needs_display();
+        layout_node->first_paintable()->set_needs_repaint();
 
     m_highlighted_node = node;
     m_highlighted_pseudo_element = pseudo_element;
 
     if (auto layout_node = highlighted_layout_node(); layout_node && layout_node->first_paintable())
-        layout_node->first_paintable()->set_needs_display();
+        layout_node->first_paintable()->set_needs_repaint();
 }
 
 GC::Ptr<Layout::Node> Document::highlighted_layout_node()
@@ -1968,8 +2008,9 @@ GC::Ptr<Layout::Node> Document::highlighted_layout_node()
     if (!m_highlighted_node)
         return nullptr;
 
+    // NB: Called during painting inside update_layout().
     if (!m_highlighted_pseudo_element.has_value() || !m_highlighted_node->is_element())
-        return m_highlighted_node->layout_node();
+        return m_highlighted_node->unsafe_layout_node();
 
     auto const& element = static_cast<Element const&>(*m_highlighted_node);
     return element.get_pseudo_element_node(m_highlighted_pseudo_element.value());
@@ -2150,7 +2191,7 @@ void Document::set_hovered_node(GC::Ptr<Node> node)
 
     // https://w3c.github.io/uievents/#mouseleave
     if (old_hovered_node && (!m_hovered_node || !m_hovered_node->is_descendant_of(*old_hovered_node))) {
-        for (auto target = old_hovered_node; target && target.ptr() != common_ancestor; target = target->parent()) {
+        for (auto target = old_hovered_node; target && target.ptr() != common_ancestor; target = target->parent_or_shadow_host()) {
             // FIXME: Populate the event with mouse coordinates, etc.
             UIEvents::MouseEventInit mouse_event_init {};
             mouse_event_init.related_target = m_hovered_node;
@@ -2192,7 +2233,7 @@ void Document::set_hovered_node(GC::Ptr<Node> node)
     // Leave events are dispatched in the opposite order.
     if (m_hovered_node && (!old_hovered_node || !m_hovered_node->is_ancestor_of(*old_hovered_node))) {
         Vector<GC::Ref<Node>> entered_ancestors;
-        for (auto target = m_hovered_node; target && target.ptr() != common_ancestor; target = target->parent())
+        for (auto target = m_hovered_node; target && target.ptr() != common_ancestor; target = target->parent_or_shadow_host())
             entered_ancestors.append(*target);
 
         for (auto target : entered_ancestors.in_reverse()) {
@@ -2316,9 +2357,7 @@ GC::Ref<HTML::HTMLAllCollection> Document::all()
 // https://drafts.csswg.org/css-font-loading/#font-source
 GC::Ref<CSS::FontFaceSet> Document::fonts()
 {
-    if (!m_fonts)
-        m_fonts = CSS::FontFaceSet::create(realm());
-    return *m_fonts;
+    return m_fonts;
 }
 
 // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-clear
@@ -2749,8 +2788,7 @@ void Document::set_focused_area(GC::Ptr<Node> node)
 
     reset_cursor_blink_cycle();
 
-    if (paintable())
-        paintable()->set_needs_display();
+    set_needs_repaint();
 
     // Scroll the viewport if necessary to make the newly focused element visible.
     if (new_focused_element) {
@@ -2799,8 +2837,7 @@ void Document::set_active_element(GC::Ptr<Element> element)
 
     m_active_element = element;
 
-    if (paintable())
-        paintable()->set_needs_display();
+    set_needs_repaint();
 }
 
 void Document::set_target_element(GC::Ptr<Element> element)
@@ -2831,8 +2868,7 @@ void Document::set_target_element(GC::Ptr<Element> element)
 
     m_target_element = element;
 
-    if (paintable())
-        paintable()->set_needs_display();
+    set_needs_repaint();
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#the-indicated-part-of-the-document
@@ -3451,11 +3487,8 @@ bool Document::is_cookie_averse() const
         return true;
 
     // * A Document whose URL's scheme is not an HTTP(S) scheme.
-    if (!url().scheme().is_one_of("http"sv, "https"sv)) {
-        // AD-HOC: This allows us to write cookie integration tests.
-        if (!m_enable_cookies_on_file_domains || url().scheme() != "file"sv)
-            return true;
-    }
+    if (!url().scheme().is_one_of("http"sv, "https"sv))
+        return true;
 
     return false;
 }
@@ -3527,6 +3560,8 @@ void Document::set_bg_color(String const& value)
 
 String Document::dump_dom_tree_as_json() const
 {
+    const_cast<Document&>(*this).update_layout(UpdateLayoutReason::InspectDOMTree);
+
     StringBuilder builder;
     auto json = MUST(JsonObjectSerializer<>::try_create(builder));
     serialize_tree_as_json(json);
@@ -4016,7 +4051,8 @@ void Document::set_page_showing(bool page_showing)
 
 void Document::invalidate_stacking_context_tree()
 {
-    if (auto* paintable_box = this->paintable_box())
+    // NB: Called during stacking context invalidation.
+    if (auto* paintable_box = this->unsafe_paintable_box())
         paintable_box->invalidate_stacking_context();
 }
 
@@ -4445,6 +4481,7 @@ void Document::run_unloading_cleanup_steps()
     }
 
     FileAPI::run_unloading_cleanup_steps(*this);
+    fully_exit_fullscreen();
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
@@ -4878,6 +4915,9 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
         break;
     case PolicyControlledFeature::FocusWithoutUserActivation:
     case PolicyControlledFeature::EncryptedMedia:
+        // FIXME: Implement allowlist for this.
+        return true;
+    case PolicyControlledFeature::Fullscreen:
         // FIXME: Implement allowlist for this.
         return true;
     case PolicyControlledFeature::Gamepad:
@@ -5541,6 +5581,16 @@ Painting::ViewportPaintable* Document::paintable()
     return static_cast<Painting::ViewportPaintable*>(Node::paintable());
 }
 
+Painting::ViewportPaintable const* Document::unsafe_paintable() const
+{
+    return static_cast<Painting::ViewportPaintable const*>(Node::unsafe_paintable());
+}
+
+Painting::ViewportPaintable* Document::unsafe_paintable()
+{
+    return static_cast<Painting::ViewportPaintable*>(Node::unsafe_paintable());
+}
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-the-history-object-state
 void Document::restore_the_history_object_state(GC::Ref<HTML::SessionHistoryEntry> entry)
 {
@@ -5731,12 +5781,14 @@ void Document::update_animations_and_send_events(double timestamp)
         for (auto const& timeline : timelines_to_update) {
             timeline->update_current_time(timestamp);
 
-            for (auto const& animation : timeline->associated_animations())
-                animation->update();
+            for (auto& animation : timeline->associated_animations())
+                animation.update();
 
-            auto animations = GC::RootVector { heap(), timeline->associated_animations().values() };
+            auto animations = GC::RootVector<GC::Ref<Animations::Animation>> { heap() };
+            for (auto& animation : timeline->associated_animations())
+                animations.append(animation);
             for (auto& animation : animations)
-                dispatch_events_for_animation_if_necessary(animation.as_nonnull());
+                dispatch_events_for_animation_if_necessary(animation);
         }
 
         // 2. Remove replaced animations for doc.
@@ -5807,21 +5859,21 @@ void Document::remove_replaced_animations()
 
     Vector<GC::Ref<Animations::Animation>> replaceable_animations;
     for (auto const& timeline : m_associated_animation_timelines) {
-        for (auto const& animation : timeline->associated_animations()) {
-            if (!animation->effect() || !animation->effect()->target() || &animation->effect()->target()->document() != this)
+        for (auto& animation : timeline->associated_animations()) {
+            if (!animation.effect() || !animation.effect()->target() || &animation.effect()->target()->document() != this)
                 continue;
 
-            if (!animation->is_replaceable())
+            if (!animation.is_replaceable())
                 continue;
 
-            if (animation->replace_state() != Bindings::AnimationReplaceState::Active)
+            if (animation.replace_state() != Bindings::AnimationReplaceState::Active)
                 continue;
 
             // Composite order is only defined for KeyframeEffects
-            if (!animation->effect()->is_keyframe_effect())
+            if (!animation.effect()->is_keyframe_effect())
                 continue;
 
-            replaceable_animations.append(animation.as_nonnull());
+            replaceable_animations.append(animation);
         }
     }
 
@@ -6007,6 +6059,10 @@ void Document::set_design_mode_enabled_state(bool design_mode_enabled)
 {
     m_design_mode_enabled = design_mode_enabled;
     set_editable(design_mode_enabled);
+    for_each_in_inclusive_subtree([](Node& node) {
+        node.recompute_editable_subtree_flag();
+        return TraversalDecision::Continue;
+    });
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#making-entire-documents-editable:-the-designmode-idl-attribute
@@ -6436,7 +6492,7 @@ WebIDL::ExceptionOr<void> Document::set_adopted_style_sheets(JS::Value new_value
     return {};
 }
 
-void Document::for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&)>&& callback) const
+void Document::for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&)> const& callback) const
 {
     if (m_style_sheets) {
         for (auto& style_sheet : m_style_sheets->sheets()) {
@@ -6552,10 +6608,6 @@ bool Document::is_decoded_svg() const
 // https://drafts.csswg.org/css-position-4/#add-an-element-to-the-top-layer
 void Document::add_an_element_to_the_top_layer(GC::Ref<Element> element)
 {
-    // AD-HOC: The root element is excluded from the top layer
-    if (element == this->document_element())
-        return;
-
     // 1. Let doc be el’s node document.
 
     // 2. If el is already contained in doc’s top layer:
@@ -6619,9 +6671,10 @@ void Document::process_top_layer_removals()
     // 1. For each element el in doc’s pending top layer removals: if el’s computed value of overlay is none, or el is
     //    not rendered, remove el from doc’s top layer and pending top layer removals.
     GC::RootVector<GC::Ref<Element>> elements_to_remove(heap());
+    // NB: Called during top layer processing.
     for (auto& element : m_top_layer_pending_removals) {
         // FIXME: Implement overlay property
-        if (!element->paintable()) {
+        if (!element->unsafe_paintable()) {
             elements_to_remove.append(element);
         }
     }
@@ -6654,7 +6707,8 @@ GC::Ptr<HTML::HTMLElement> Document::topmost_auto_or_hint_popover()
 
 void Document::set_needs_to_refresh_scroll_state(bool b)
 {
-    if (auto* paintable = this->paintable())
+    // NB: Propagating scroll state invalidation.
+    if (auto* paintable = this->unsafe_paintable())
         paintable->set_needs_to_refresh_scroll_state(b);
 }
 
@@ -6757,6 +6811,330 @@ void Document::add_render_blocking_element(GC::Ref<Element> element)
 void Document::remove_render_blocking_element(GC::Ref<Element> element)
 {
     m_render_blocking_elements.remove(element);
+}
+
+// https://fullscreen.spec.whatwg.org/#run-the-fullscreen-steps
+void Document::run_fullscreen_steps()
+{
+    // 1. Let pendingEvents be document’s list of pending fullscreen events.
+    auto pending_events = GC::ConservativeVector<PendingFullscreenEvent> { vm().heap() };
+    pending_events.extend(m_pending_fullscreen_events);
+
+    // 2. Empty document’s list of pending fullscreen events.
+    m_pending_fullscreen_events.clear();
+
+    // 3. For each (type, element) in pendingEvents:
+    for (auto const& [type, element] : pending_events) {
+        // 1. Let target be element if element is connected and its node document is document, and otherwise let target be document.
+        GC::Ref<Node> target { *this };
+        if (element->is_connected() && &element->document() == this)
+            target = element;
+
+        // 2. Fire an event named type, with its bubbles and composed attributes set to true, at target.
+        switch (type) {
+        case PendingFullscreenEvent::Type::Change:
+            target->dispatch_event(Event::create(realm(), HTML::EventNames::fullscreenchange, EventInit { .bubbles = true, .composed = true }));
+            break;
+        case PendingFullscreenEvent::Type::Error:
+            target->dispatch_event(Event::create(realm(), HTML::EventNames::fullscreenerror, EventInit { .bubbles = true, .composed = true }));
+            break;
+        }
+    }
+}
+
+void Document::append_pending_fullscreen_change(PendingFullscreenEvent::Type type, GC::Ref<Element> element)
+{
+    m_pending_fullscreen_events.append(PendingFullscreenEvent { type, element });
+}
+
+// https://fullscreen.spec.whatwg.org/#fullscreen-an-element
+void Document::fullscreen_element_within_doc(GC::Ref<Element> element)
+{
+    // FIXME: Spec issue:  Finding topmost popover ancestor algorithm takes different parameters than those described
+    //        by the fullscreen spec. Since the new algorithm takes 4 parameters, with the new "popover list", we must
+    //        also account for the auto popover list.
+    //        See: https://github.com/whatwg/fullscreen/issues/245
+    auto const get_hide_until = [&](auto const& popover_list) {
+        return HTML::HTMLElement::topmost_popover_ancestor(element, popover_list, nullptr, HTML::IsPopover::No);
+    };
+
+    // 1. Let hideUntil be the result of running topmost popover ancestor given element, null, and false.
+    auto hide_until = get_hide_until(showing_hint_popover_list());
+
+    if (hide_until == nullptr)
+        hide_until = get_hide_until(showing_auto_popover_list());
+
+    Variant<GC::Ptr<HTML::HTMLElement>, GC::Ptr<Document>> hide_until_argument { hide_until };
+
+    // 2. If hideUntil is null, then set hideUntil to element’s node document.
+    if (hide_until == nullptr)
+        hide_until_argument = GC::Ptr { element->document() };
+
+    // 3. Run hide all popovers until given hideUntil, false, and true.
+    HTML::HTMLElement::hide_all_popovers_until(hide_until_argument, HTML::FocusPreviousElement::No, HTML::FireEvents::Yes);
+
+    // 4. Set element’s fullscreen flag.
+    element->set_fullscreen_flag(true);
+
+    // 5. Remove from the top layer immediately given element.
+    remove_an_element_from_the_top_layer_immediately(element);
+
+    // 6. Add to the top layer given element.
+    add_an_element_to_the_top_layer(element);
+    element->invalidate_style(StyleInvalidationReason::Fullscreen);
+}
+
+// https://fullscreen.spec.whatwg.org/#fullscreen-element
+GC::Ptr<Element> Document::fullscreen_element() const
+{
+    // All documents have an associated fullscreen element. The fullscreen element is the topmost element in the
+    // document’s top layer whose fullscreen flag is set, if any, and null otherwise.
+    for (auto const& el : top_layer_elements().in_reverse()) {
+        if (el->is_fullscreen_element())
+            return el;
+    }
+    return nullptr;
+}
+
+// https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement
+GC::Ptr<Element> Document::fullscreen_element_for_bindings() const
+{
+    auto fullscreen_element = this->fullscreen_element();
+    if (!fullscreen_element)
+        return nullptr;
+
+    // 1. If this is a shadow root and its host is not connected, then return null.
+    // NB: We're not a shadow root. See ShadowRoot::fullscreen_element_for_bindings().
+
+    // 2. Let candidate be the result of retargeting fullscreen element against this.
+    auto* candidate = retarget(fullscreen_element, const_cast<Document*>(this));
+    if (!candidate)
+        return nullptr;
+
+    // 3. If candidate and this are in the same tree, then return candidate.
+    if (auto* retargeted_element = as<Element>(candidate); retargeted_element && &retargeted_element->root() == &root())
+        return retargeted_element;
+
+    // 4. Return null.
+    return nullptr;
+}
+
+// https://fullscreen.spec.whatwg.org/#dom-document-fullscreen
+bool Document::fullscreen() const
+{
+    // The fullscreen getter steps are to return false if this's fullscreen element is null, and true otherwise.
+    return fullscreen_element() != nullptr;
+}
+
+// https://fullscreen.spec.whatwg.org/#dom-document-fullscreenenabled
+bool Document::fullscreen_enabled() const
+{
+    // FIXME: Implement check policy check and "is supported" check.
+    return is_allowed_to_use_feature(PolicyControlledFeature::Fullscreen);
+}
+
+// https://fullscreen.spec.whatwg.org/#fully-exit-fullscreen
+void Document::fully_exit_fullscreen()
+{
+    // 1. If document’s fullscreen element is null, terminate these steps.
+    GC::Ptr<Element> fullscreened_element = fullscreen_element();
+    if (!fullscreened_element)
+        return;
+
+    // 2. Unfullscreen elements whose fullscreen flag is set, within document’s top layer, except for document’s fullscreen element.
+    GC::RootVector<GC::Ref<Element>, 8> fullscreen_elements { heap() };
+    for (auto const& element : top_layer_elements()) {
+        if (element->is_fullscreen_element() && element != fullscreened_element)
+            fullscreen_elements.append(element);
+    }
+
+    for (auto const& element : fullscreen_elements)
+        unfullscreen_element(element);
+
+    // 3. Exit fullscreen document.
+    HTML::TemporaryExecutionContext context { realm(), HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+    exit_fullscreen();
+}
+
+// https://fullscreen.spec.whatwg.org/#exit-fullscreen
+GC::Ref<WebIDL::Promise> Document::exit_fullscreen()
+{
+    auto& realm = this->realm();
+
+    // 1. Let promise be a new promise.
+    auto promise = WebIDL::create_promise(realm);
+
+    // 2. If doc is not fully active or doc’s fullscreen element is null, then reject promise with a TypeError exception
+    //    and return promise.
+    if (!is_fully_active() || !fullscreen_element()) {
+        WebIDL::reject_promise(realm, promise, JS::TypeError::create(realm, "Document not fully active or no fullscreen element."sv));
+        return promise;
+    }
+
+    // 3. Let resize be false.
+    bool resize = false;
+
+    // 4. Let docs be the result of collecting documents to unfullscreen given doc.
+    auto docs = collect_documents_to_unfullscreen();
+
+    // 5. Let topLevelDoc be doc’s node navigable’s top-level traversable’s active document.
+    auto top_level_doc = navigable()->top_level_traversable()->active_document();
+
+    // 6. If topLevelDoc is in docs, and it is a simple fullscreen document, then set doc to topLevelDoc and resize to true.
+    GC::Ref<Document> document_to_unfullscreen { *this };
+    if (top_level_doc && top_level_doc->is_simple_fullscreen_document() && docs->elements().contains_slow(GC::Ref { *top_level_doc })) {
+        document_to_unfullscreen = *top_level_doc;
+        resize = true;
+    }
+
+    // 7. If doc’s fullscreen element is not connected:
+    if (auto fullscreen_element = document_to_unfullscreen->fullscreen_element(); !fullscreen_element->is_connected()) {
+        // 1. Append (fullscreenchange, doc’s fullscreen element) to doc’s list of pending fullscreen events.
+        document_to_unfullscreen->append_pending_fullscreen_change(PendingFullscreenEvent::Type::Change, *fullscreen_element);
+
+        // 2. Unfullscreen doc’s fullscreen element.
+        document_to_unfullscreen->unfullscreen_element(*fullscreen_element);
+    }
+
+    // 8. Return promise, and run the remaining steps in parallel.
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [&realm, document_to_unfullscreen, promise, resize] {
+        HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
+        // FIXME: 9. Run the fully unlock the screen orientation steps with doc.
+
+        // 10. If resize is true, resize doc’s viewport to its "normal" dimensions.
+        // NB: Fullscreen API is affected by site-isolation and will require additional work once site-isolation is implemented.
+        if (resize)
+            document_to_unfullscreen->page().client().page_did_request_exit_fullscreen();
+
+        // 11. If doc’s fullscreen element is null, then resolve promise with undefined and terminate these steps.
+        if (!document_to_unfullscreen->fullscreen_element()) {
+            WebIDL::resolve_promise(realm, promise, JS::js_undefined());
+            return;
+        }
+
+        // 12. Let exitDocs be the result of collecting documents to unfullscreen given doc.
+        auto exit_docs = document_to_unfullscreen->collect_documents_to_unfullscreen();
+
+        // 13. Let descendantDocs be an ordered set consisting of doc’s descendant navigables' active documents whose
+        //     fullscreen element is non-null, if any, in tree order.
+        auto descendant_docs = realm.heap().allocate<GC::HeapVector<GC::Ref<Document>>>();
+        for (auto& descendant : document_to_unfullscreen->descendant_navigables()) {
+            if (descendant->active_document()->fullscreen_element())
+                descendant_docs->elements().append(*descendant->active_document());
+        }
+
+        // 14. For each exitDoc in exitDocs:
+        for (auto& exit_doc : exit_docs->elements()) {
+            // 1. Append (fullscreenchange, exitDoc’s fullscreen element) to exitDoc’s list of pending fullscreen events.
+            exit_doc->append_pending_fullscreen_change(PendingFullscreenEvent::Type::Change, *exit_doc->fullscreen_element());
+
+            // 2. If resize is true, unfullscreen exitDoc.
+            if (resize)
+                exit_doc->unfullscreen();
+            // 3. Otherwise, unfullscreen exitDoc’s fullscreen element.
+            else
+                exit_doc->unfullscreen_element(*exit_doc->fullscreen_element());
+        }
+
+        // 15. For each descendantDoc in descendantDocs:
+        for (auto& descendant_doc : descendant_docs->elements()) {
+            // 1. Append (fullscreenchange, descendantDoc’s fullscreen element) to descendantDoc’s list of pending fullscreen events.
+            descendant_doc->append_pending_fullscreen_change(PendingFullscreenEvent::Type::Change, *descendant_doc->fullscreen_element());
+
+            // 2. Unfullscreen descendantDoc.
+            descendant_doc->unfullscreen();
+        }
+
+        // Note: The order in which documents are unfullscreened is not observable, because run the fullscreen steps is
+        //       invoked in tree order.
+
+        // 16. Resolve promise with undefined.
+        WebIDL::resolve_promise(realm, promise, JS::js_undefined());
+    }));
+
+    return promise;
+}
+
+// https://fullscreen.spec.whatwg.org/#unfullscreen-a-document
+void Document::unfullscreen()
+{
+    // To unfullscreen a document, unfullscreen all elements, within document’s top layer, whose fullscreen flag is set.
+    // NB: This has to be a copy of the list of those elements, since unfullscreen an element immediately removes it
+    //     from the top layer, invalidating iterators.
+    auto fullscreen_elements = heap().allocate<GC::HeapVector<GC::Ref<Element>>>();
+    for (auto el : top_layer_elements()) {
+        if (el->is_fullscreen_element())
+            fullscreen_elements->elements().append(el);
+    }
+
+    for (auto el : fullscreen_elements->elements())
+        unfullscreen_element(el);
+}
+
+// https://fullscreen.spec.whatwg.org/#simple-fullscreen-document
+bool Document::is_simple_fullscreen_document() const
+{
+    // A document is said to be a simple fullscreen document if there is exactly one element in its top layer that has its fullscreen flag set.
+    u32 total = 0;
+    for (auto const& element : top_layer_elements()) {
+        if (element->is_fullscreen_element())
+            ++total;
+
+        if (total > 1)
+            return false;
+    }
+    return total == 1;
+}
+
+// https://fullscreen.spec.whatwg.org/#collect-documents-to-unfullscreen
+GC::Ref<GC::HeapVector<GC::Ref<Document>>> Document::collect_documents_to_unfullscreen()
+{
+    // 1. Let docs be an ordered set consisting of doc.
+    auto docs = heap().allocate<GC::HeapVector<GC::Ref<Document>>>();
+    docs->elements().append(*this);
+
+    // 2. While true:
+    while (true) {
+        // 1. Let lastDoc be docs’s last document.
+        auto last_doc = docs->elements().last();
+
+        // 2. Assert: lastDoc’s fullscreen element is not null.
+        VERIFY(last_doc->fullscreen_element());
+
+        // 3. If lastDoc is not a simple fullscreen document, break.
+        if (!last_doc->is_simple_fullscreen_document())
+            break;
+
+        // 4. Let container be lastDoc’s node navigable’s container.
+        // Note on spec: It doesn't first check if `node navigable` is null.
+        auto container = last_doc->navigable() ? last_doc->navigable()->container() : nullptr;
+
+        // 5. If container is null, then break.
+        if (!container)
+            break;
+
+        // 6. If container’s iframe fullscreen flag is set, break.
+        if (auto* iframe_element = as_if<HTML::HTMLIFrameElement>(container.ptr()); iframe_element && iframe_element->iframe_fullscreen_flag())
+            break;
+
+        // 7. Append container’s node document to docs.
+        docs->elements().append(container->document());
+    }
+
+    // 3. Return docs.
+    return docs;
+}
+
+// https://fullscreen.spec.whatwg.org/#unfullscreen-an-element
+void Document::unfullscreen_element(GC::Ref<Element> element)
+{
+    // To unfullscreen an element, unset element’s fullscreen flag and iframe fullscreen flag (if any), and remove from
+    // the top layer immediately given element.
+    element->set_fullscreen_flag(false);
+    if (auto* iframe_element = as_if<HTML::HTMLIFrameElement>(element.ptr()))
+        iframe_element->set_iframe_fullscreen_flag(false);
+
+    remove_an_element_from_the_top_layer_immediately(element);
 }
 
 // https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
@@ -6886,19 +7264,23 @@ void Document::set_cached_navigable(GC::Ptr<HTML::Navigable> navigable)
     m_cached_navigable = navigable.ptr();
 }
 
-void Document::set_needs_display(InvalidateDisplayList should_invalidate_display_list)
+void Document::notify_css_background_image_loaded()
 {
-    set_needs_display(viewport_rect(), should_invalidate_display_list);
+    // FIXME: Do less than a full repaint if possible?
+    if (auto* paintable = unsafe_paintable()) {
+        paintable->for_each_in_inclusive_subtree_of_type<Painting::PaintableBox>([](auto& paintable_box) {
+            paintable_box.invalidate_paint_cache();
+            return TraversalDecision::Continue;
+        });
+    }
+    set_needs_repaint();
 }
 
-void Document::set_needs_display(CSSPixelRect const&, InvalidateDisplayList should_invalidate_display_list)
+void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
 {
-    // FIXME: Ignore updates outside the visible viewport rect.
-    //        This requires accounting for fixed-position elements in the input rect, which we don't do yet.
-
     auto navigable = this->navigable();
 
-    // OPTIMIZATION: Ignore set_needs_display() inside navigable containers (i.e frames) with visibility: hidden.
+    // OPTIMIZATION: Ignore set_needs_repaint() inside navigable containers (i.e frames) with visibility: hidden.
     if (navigable && navigable->has_inclusive_ancestor_with_visibility_hidden())
         return;
 
@@ -6916,7 +7298,7 @@ void Document::set_needs_display(CSSPixelRect const&, InvalidateDisplayList shou
     }
 
     if (auto container = navigable->container()) {
-        container->document().set_needs_display(should_invalidate_display_list);
+        container->document().set_needs_repaint(should_invalidate_display_list);
     }
 }
 
@@ -6929,6 +7311,11 @@ void Document::invalidate_display_list()
         return;
 
     if (auto container = navigable->container()) {
+        // The container's paintable may have cached paint commands that include a PaintNestedDisplayList
+        // holding a stale reference to this document's old display list. Clear the cache so the container
+        // re-executes paint() and picks up the freshly recorded display list.
+        if (auto* paintable_box = container->unsafe_paintable_box())
+            paintable_box->invalidate_paint_cache();
         container->document().invalidate_display_list();
     }
 }
@@ -6943,7 +7330,7 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
     if (m_cached_display_list && m_cached_display_list_paint_config == config)
         return m_cached_display_list;
 
-    auto display_list = Painting::DisplayList::create(page().client().device_pixels_per_css_pixel());
+    auto display_list = Painting::DisplayList::create();
     Painting::DisplayListRecorder display_list_recorder(display_list);
 
     // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
@@ -7109,6 +7496,26 @@ void Document::set_onvisibilitychange(WebIDL::CallbackType* value)
     set_event_handler_attribute(HTML::EventNames::visibilitychange, value);
 }
 
+WebIDL::CallbackType* Document::onfullscreenchange()
+{
+    return event_handler_attribute(HTML::EventNames::fullscreenchange);
+}
+
+void Document::set_onfullscreenchange(WebIDL::CallbackType* value)
+{
+    set_event_handler_attribute(HTML::EventNames::fullscreenchange, value);
+}
+
+WebIDL::CallbackType* Document::onfullscreenerror()
+{
+    return event_handler_attribute(HTML::EventNames::fullscreenerror);
+}
+
+void Document::set_onfullscreenerror(WebIDL::CallbackType* value)
+{
+    set_event_handler_attribute(HTML::EventNames::fullscreenerror, value);
+}
+
 // https://drafts.csswg.org/css-view-transitions-1/#dom-document-startviewtransition
 GC::Ptr<ViewTransition::ViewTransition> Document::start_view_transition(GC::Ptr<WebIDL::CallbackType> update_callback)
 {
@@ -7259,27 +7666,38 @@ String Document::dump_display_list()
         dump_context(root, 1);
 
     builder.append("\nDisplayList:\n"sv);
-    int indent = 0;
-    for (auto const& item : display_list->commands()) {
-        int nesting_change = item.command.visit([](auto const& cmd) {
-            if constexpr (requires { cmd.nesting_level_change; })
-                return cmd.nesting_level_change;
-            return 0;
-        });
 
-        if (nesting_change < 0)
-            indent = max(0, indent + nesting_change);
+    Function<void(Painting::DisplayList const&, int)> dump_commands =
+        [&](Painting::DisplayList const& list, int base_indent) {
+            int indent = base_indent;
+            for (auto const& item : list.commands()) {
+                int nesting_change = item.command.visit([](auto const& cmd) {
+                    if constexpr (requires { cmd.nesting_level_change; })
+                        return cmd.nesting_level_change;
+                    return 0;
+                });
 
-        builder.append_repeated(' ', indent * 2);
-        item.command.visit([&](auto const& command) {
-            builder.appendff("{}@{}", command.command_name, item.context ? item.context->id() : 0);
-            command.dump(builder);
-        });
-        builder.append('\n');
+                if (nesting_change < 0)
+                    indent = max(base_indent, indent + nesting_change);
 
-        if (nesting_change > 0)
-            indent += nesting_change;
-    }
+                builder.append_repeated(' ', indent * 2);
+                item.command.visit([&](auto const& command) {
+                    builder.appendff("{}@{}", command.command_name, item.context ? item.context->id() : 0);
+                    command.dump(builder);
+                });
+                builder.append('\n');
+
+                if (auto const* nested = item.command.get_pointer<Painting::PaintNestedDisplayList>()) {
+                    if (nested->display_list)
+                        dump_commands(*nested->display_list, indent + 1);
+                }
+
+                if (nesting_change > 0)
+                    indent += nesting_change;
+            }
+        };
+
+    dump_commands(*display_list, 0);
 
     return builder.to_string_without_validation();
 }
@@ -7425,13 +7843,271 @@ void Document::ensure_cookie_version_index(URL::URL const& new_url, URL::URL con
     m_cookie_version_index = {};
 }
 
-GC::Ptr<Element> ElementByIdMap::get(FlyString const& element_id) const
+void Document::build_counter_style_cache()
 {
-    if (auto elements = m_map.get(element_id); elements.has_value() && !elements->is_empty()) {
-        if (auto element = elements->first())
-            return *element;
+    m_registered_counter_styles.clear_with_capacity();
+
+    HashMap<FlyString, CSS::CounterStyleDefinition> counter_style_definitions;
+
+    auto const define_complex_predefined_counter_styles = [&]() {
+        // https://drafts.csswg.org/css-counter-styles-3/#complex-predefined-counters
+        // While authors may define their own counter styles using the @counter-style rule or rely on the set of
+        // predefined counter styles, a few counter styles are described by rules that are too complex to be captured by
+        // the predefined algorithms.
+
+        // FIXME: All of the counter styles defined in this section have a spoken form of numbers
+
+        // https://drafts.csswg.org/css-counter-styles-3/#ethiopic-numeric-counter-style
+        // For this system, the name is "ethiopic-numeric", the range is 1 infinite, the suffix is "/ " (U+002F SOLIDUS
+        // followed by a U+0020 SPACE), and the rest of the descriptors have their initial value.
+        counter_style_definitions.set(
+            "ethiopic-numeric"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "ethiopic-numeric"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::EthiopicNumericCounterStyleAlgorithm {} },
+                {},
+                {},
+                "/ "_fly_string,
+                Vector<CSS::CounterStyleRangeEntry> { { 1, AK::NumericLimits<i64>::max() } },
+                {},
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#extended-range-optional
+        // For all of these counter styles, the descriptors are the same as for the limited range variants, except for
+        // the range, which is calc(-1 * pow(10, 16) + 1) calc(pow(10, 16) - 1).
+        Vector<CSS::CounterStyleRangeEntry> extended_cjk_range { { -9999999999999999, 9999999999999999 } };
+
+        // https://drafts.csswg.org/css-counter-styles-3/#limited-chinese
+        // For all of these counter styles, the suffix is "、" U+3001, the fallback is cjk-decimal, the range is -9999
+        // 9999, and the negative value is given in the table of symbols for each style.
+
+        //                  simp-chinese-informal simp-chinese-formal trad-chinese-informal trad-chinese-formal
+        // Negative Sign    负 U+8D1F             负 U+8D1F           負 U+8CA0              負 U+8CA0
+
+        // https://drafts.csswg.org/css-counter-styles-3/#simp-chinese-informal
+        // simp-chinese-informal
+        counter_style_definitions.set(
+            "simp-chinese-informal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "simp-chinese-informal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::SimpChineseInformal } },
+                CSS::CounterStyleNegativeSign { "\U00008D1F"_fly_string, ""_fly_string },
+                {},
+                "\U00003001"_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#simp-chinese-formal
+        // simp-chinese-formal
+        counter_style_definitions.set(
+            "simp-chinese-formal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "simp-chinese-formal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::SimpChineseFormal } },
+                CSS::CounterStyleNegativeSign { "\U00008D1F"_fly_string, ""_fly_string },
+                {},
+                "\U00003001"_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#trad-chinese-informal
+        // trad-chinese-informal
+        counter_style_definitions.set(
+            "trad-chinese-informal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "trad-chinese-informal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::TradChineseInformal } },
+                CSS::CounterStyleNegativeSign { "\U00008CA0"_fly_string, ""_fly_string },
+                {},
+                "\U00003001"_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#trad-chinese-formal
+        // trad-chinese-formal
+        counter_style_definitions.set(
+            "trad-chinese-formal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "trad-chinese-formal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::TradChineseFormal } },
+                CSS::CounterStyleNegativeSign { "\U00008CA0"_fly_string, ""_fly_string },
+                {},
+                "\U00003001"_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#cjk-ideographic
+        // cjk-ideographic
+        // This counter style is identical to trad-chinese-informal. (It exists for legacy reasons.)
+        counter_style_definitions.set(
+            "cjk-ideographic"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "cjk-ideographic"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::TradChineseInformal } },
+                CSS::CounterStyleNegativeSign { "\U00008CA0"_fly_string, ""_fly_string },
+                {},
+                "\U00003001"_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#japanese-informal
+        // japanese-informal
+        counter_style_definitions.set(
+            "japanese-informal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "japanese-informal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::JapaneseInformal } },
+                CSS::CounterStyleNegativeSign { "\U000030DE\U000030A4\U000030CA\U000030B9"_fly_string, ""_fly_string },
+                {},
+                "\U00003001"_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#japanese-formal
+        // japanese-formal
+        counter_style_definitions.set(
+            "japanese-formal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "japanese-formal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::JapaneseFormal } },
+                CSS::CounterStyleNegativeSign { "\U000030DE\U000030A4\U000030CA\U000030B9"_fly_string, ""_fly_string },
+                {},
+                "\U00003001"_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#korean-hangul-formal
+        // korean-hangul-formal
+        counter_style_definitions.set(
+            "korean-hangul-formal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "korean-hangul-formal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::KoreanHangulFormal } },
+                CSS::CounterStyleNegativeSign { "\U0000B9C8\U0000C774\U0000B108\U0000C2A4 "_fly_string, ""_fly_string },
+                {},
+                ", "_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#korean-hanja-informal
+        // korean-hanja-informal
+        counter_style_definitions.set(
+            "korean-hanja-informal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "korean-hanja-informal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::KoreanHanjaInformal } },
+                CSS::CounterStyleNegativeSign { "\U0000B9C8\U0000C774\U0000B108\U0000C2A4 "_fly_string, ""_fly_string },
+                {},
+                ", "_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+
+        // https://drafts.csswg.org/css-counter-styles-3/#korean-hanja-formal
+        // korean-hanja-formal
+        counter_style_definitions.set(
+            "korean-hanja-formal"_fly_string,
+            CSS::CounterStyleDefinition::create(
+                "korean-hanja-formal"_fly_string,
+                CSS::CounterStyleAlgorithmOrExtends { CSS::ExtendedCJKCounterStyleAlgorithm { CSS::ExtendedCJKCounterStyleAlgorithm::Type::KoreanHanjaFormal } },
+                CSS::CounterStyleNegativeSign { "\U0000B9C8\U0000C774\U0000B108\U0000C2A4 "_fly_string, ""_fly_string },
+                {},
+                ", "_fly_string,
+                extended_cjk_range,
+                "cjk-decimal"_fly_string,
+                {}));
+    };
+
+    CSS::ComputationContext computation_context {
+        .length_resolution_context = CSS::Length::ResolutionContext::for_document(*this)
+    };
+
+    Function<void(CSS::CSSStyleSheet&)> const collect_counter_style_definitions = [&](CSS::CSSStyleSheet const& style_sheet) {
+        style_sheet.for_each_effective_counter_style_at_rule([&](CSS::CSSCounterStyleRule const& counter_style_rule) {
+            if (auto const& definition = CSS::CounterStyleDefinition::from_counter_style_rule(counter_style_rule, computation_context); definition.has_value())
+                counter_style_definitions.set(definition->name(), *definition);
+        });
+    };
+
+    m_style_scope.for_each_stylesheet(CSS::CascadeOrigin::UserAgent, collect_counter_style_definitions);
+    define_complex_predefined_counter_styles();
+    m_style_scope.for_each_stylesheet(CSS::CascadeOrigin::User, collect_counter_style_definitions);
+    m_style_scope.for_each_stylesheet(CSS::CascadeOrigin::Author, collect_counter_style_definitions);
+
+    // FIXME: Implement the non-css-definable (i.e. longhand east asian and `ethiopic-numeric`) counter styles.
+    VERIFY(counter_style_definitions.contains("decimal"_fly_string));
+
+    auto const is_part_of_extends_cycle = [&](FlyString const& counter_style_name) {
+        HashTable<FlyString> visited;
+        auto current_counter_style_name = counter_style_name;
+
+        while (true) {
+            if (visited.contains(current_counter_style_name))
+                return true;
+
+            visited.set(current_counter_style_name);
+
+            auto const& current_definition = counter_style_definitions.get(current_counter_style_name);
+
+            // NB: Counter styles which extend non-existent counter styles are defaulted to extending "decimal" which
+            //     itself doesn't extend any other counter style so they can't be part of a cycle.
+            if (!current_definition.has_value())
+                return false;
+
+            if (current_definition->algorithm().has<CSS::CounterStyleAlgorithm>())
+                return false;
+
+            current_counter_style_name = current_definition->algorithm().get<CSS::CounterStyleSystemStyleValue::Extends>().name;
+        }
+
+        VERIFY_NOT_REACHED();
+    };
+
+    // NB: We register non-extending counter styles immediately and then extending counter styles after we have
+    //     registered their corresponding extended counter style.
+    Vector<CSS::CounterStyleDefinition> extending_counter_styles;
+
+    for (auto const& [name, definition] : counter_style_definitions) {
+        // NB: We don't need to wait for this counter style's extended counter style to be registered since it doesn't
+        //     have one - register it immediately.
+        if (definition.algorithm().has<CSS::CounterStyleAlgorithm>()) {
+            m_registered_counter_styles.set(name, CSS::CounterStyle::from_counter_style_definition(definition, m_registered_counter_styles));
+            continue;
+        }
+
+        auto extends = definition.algorithm().get<CSS::CounterStyleSystemStyleValue::Extends>();
+
+        if (!counter_style_definitions.contains(extends.name) || is_part_of_extends_cycle(name)) {
+            auto copied = definition;
+            copied.set_algorithm(CSS::CounterStyleSystemStyleValue::Extends { "decimal"_fly_string });
+            extending_counter_styles.append(copied);
+        } else {
+            extending_counter_styles.append(definition);
+        }
     }
-    return {};
+
+    // FIXME: This is O(n^2) in the worst case but we usually don't see many counter styles so it should be fine in practice.
+    while (!extending_counter_styles.is_empty()) {
+        for (size_t i = 0; i < extending_counter_styles.size(); ++i) {
+            auto const& definition = extending_counter_styles.at(i);
+            auto extends = definition.algorithm().get<CSS::CounterStyleSystemStyleValue::Extends>();
+
+            if (!m_registered_counter_styles.contains(extends.name))
+                continue;
+
+            m_registered_counter_styles.set(definition.name(), CSS::CounterStyle::from_counter_style_definition(definition, m_registered_counter_styles));
+            extending_counter_styles.remove(i);
+            --i;
+        }
+    }
 }
 
 StringView to_string(SetNeedsLayoutReason reason)

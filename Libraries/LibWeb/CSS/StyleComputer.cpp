@@ -31,6 +31,7 @@
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSTransition.h>
+#include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/FontComputer.h>
@@ -271,7 +272,8 @@ Vector<MatchingRule const*> StyleComputer::collect_matching_rules(DOM::AbstractE
             || (element_shadow_root && rule_root == element_shadow_root)
             || from_user_agent_or_user_stylesheet
             || rule_to_run.slotted
-            || rule_to_run.contains_part_pseudo_element;
+            || rule_to_run.contains_part_pseudo_element
+            || (shadow_root && !rule_root && shadow_root->uses_document_style_sheets());
 
         if (!rule_is_relevant_for_current_scope)
             return;
@@ -2393,16 +2395,10 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_border_or_outline_width(N
     // https://drafts.csswg.org/css-backgrounds/#border-width
     // absolute length, snapped as a border width
     auto const absolute_length = [&]() -> CSSPixels {
-        if (absolutized_value->is_calculated())
-            return absolutized_value->as_calculated().resolve_length({})->absolute_length_to_px();
-
-        if (absolutized_value->is_length())
-            return absolutized_value->as_length().length().absolute_length_to_px();
-
         if (absolutized_value->is_keyword())
             return line_width_keyword_to_css_pixels(absolutized_value->to_keyword());
 
-        VERIFY_NOT_REACHED();
+        return Length::from_style_value(absolutized_value, {}).absolute_length_to_px();
     }();
 
     return LengthStyleValue::create(Length::make_px(snap_a_length_as_a_border_width(device_pixels_per_css_pixel, absolute_length)));
@@ -2809,16 +2805,6 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_math_depth(NonnullRefPtr<
         ? inheritance_parent->computed_properties()->math_style()
         : InitialValues::math_style();
 
-    auto resolve_integer = [&](StyleValue const& integer_value) {
-        if (integer_value.is_integer())
-            return integer_value.as_integer().integer();
-
-        if (integer_value.is_calculated())
-            return integer_value.as_calculated().resolve_integer({}).value();
-
-        VERIFY_NOT_REACHED();
-    };
-
     // The computed value of the math-depth value is determined as follows:
     // - If the specified value of math-depth is auto-add and the inherited value of math-style is compact
     //   then the computed value of math-depth of the element is its inherited value plus one.
@@ -2828,12 +2814,12 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_math_depth(NonnullRefPtr<
     // - If the specified value of math-depth is of the form add(<integer>) then the computed value of
     //   math-depth of the element is its inherited value plus the specified integer.
     if (absolutized_value->is_add_function())
-        return IntegerStyleValue::create(inherited_math_depth + resolve_integer(*absolutized_value->as_add_function().value()));
+        return IntegerStyleValue::create(inherited_math_depth + int_from_style_value(absolutized_value->as_add_function().value()));
 
     // - If the specified value of math-depth is of the form <integer> then the computed value of math-depth
     //   of the element is the specified integer.
     if (absolutized_value->is_integer() || absolutized_value->is_calculated())
-        return IntegerStyleValue::create(resolve_integer(*absolutized_value));
+        return IntegerStyleValue::create(int_from_style_value(absolutized_value));
 
     // - Otherwise, the computed value of math-depth of the element is the inherited one.
     return IntegerStyleValue::create(inherited_math_depth);

@@ -75,6 +75,12 @@ void ShorthandStyleValue::serialize(StringBuilder& builder, SerializationMode mo
                 return;
         }
 
+        // If any non-reset-only longhand is not a value list, we can't serialize as a coordinating-list shorthand.
+        for (auto sub_property : m_properties.sub_properties) {
+            if (!reset_only_longhands.contains_slow(sub_property) && !longhand(sub_property)->is_value_list())
+                return;
+        }
+
         auto entry_count = longhand(m_properties.sub_properties[0])->as_value_list().size();
 
         // If we don't have the same number of values for each non-reset-only longhand, we can't serialize this shorthand.
@@ -713,7 +719,7 @@ void ShorthandStyleValue::serialize(StringBuilder& builder, SerializationMode mo
         auto& rows = rows_value->as_grid_track_size_list();
         auto& columns = columns_value->as_grid_track_size_list();
 
-        if (areas.grid_template_area().size() == 0 && rows.grid_track_size_list().track_list().size() == 0 && columns.grid_track_size_list().track_list().size() == 0) {
+        if (areas.row_count() == 0 && rows.grid_track_size_list().track_list().size() == 0 && columns.grid_track_size_list().track_list().size() == 0) {
             builder.append("none"sv);
             return;
         }
@@ -729,14 +735,14 @@ void ShorthandStyleValue::serialize(StringBuilder& builder, SerializationMode mo
                     line_names->serialize(inner_builder);
                 }
                 if (auto* track_size = track_size_or_line_names.get_pointer<ExplicitGridTrack>()) {
-                    if (area_index < areas.grid_template_area().size()) {
+                    if (area_index < areas.row_count()) {
                         if (!inner_builder.is_empty())
                             inner_builder.append(' ');
                         inner_builder.append("\""sv);
-                        for (size_t y = 0; y < areas.grid_template_area()[area_index].size(); ++y) {
+                        for (size_t y = 0; y < areas.column_count(); ++y) {
                             if (y != 0)
                                 inner_builder.append(' ');
-                            inner_builder.append(areas.grid_template_area()[area_index][y]);
+                            inner_builder.append(areas.cell_name_at(area_index, y));
                         }
                         inner_builder.append("\""sv);
                     }
@@ -752,7 +758,7 @@ void ShorthandStyleValue::serialize(StringBuilder& builder, SerializationMode mo
             return MUST(inner_builder.to_string());
         };
 
-        if (areas.grid_template_area().is_empty()) {
+        if (areas.row_count() == 0) {
             rows.grid_track_size_list().serialize(builder, mode);
             builder.append(" / "sv);
             columns.grid_track_size_list().serialize(builder, mode);
@@ -767,7 +773,7 @@ void ShorthandStyleValue::serialize(StringBuilder& builder, SerializationMode mo
             builder.append(rows_serialization);
             return;
         }
-        builder.append(construct_rows_string());
+        builder.append(rows_serialization);
         builder.append(" / "sv);
         columns.grid_track_size_list().serialize(builder, mode);
         return;

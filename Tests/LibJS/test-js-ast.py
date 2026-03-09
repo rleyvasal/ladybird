@@ -55,6 +55,8 @@ def test(file: Path, rebaseline: bool) -> bool:
         "--dump-ast",
         "--parse-only",
     ]
+    if file.suffix == ".mjs":
+        args.append("--as-module")
     process = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     stdout = process.stdout.decode().strip()
@@ -66,10 +68,10 @@ def test(file: Path, rebaseline: bool) -> bool:
     expected_file = AST_TEST_DIR / "expected" / file.with_suffix(".txt")
     output_file = AST_TEST_DIR / "output" / file.with_suffix(".txt")
 
-    output_file.write_text(stdout, encoding="utf8")
+    output_file.write_text(stdout + "\n", encoding="utf8")
 
     if rebaseline:
-        expected_file.write_text(stdout, encoding="utf8")
+        expected_file.write_text(stdout + "\n", encoding="utf8")
         return False
 
     expected = expected_file.read_text(encoding="utf8").strip()
@@ -96,7 +98,9 @@ def main() -> int:
     input_dir = AST_TEST_DIR / "input"
     failed = 0
 
-    js_files = [js_file for js_file in sorted(input_dir.iterdir()) if js_file.is_file() and js_file.suffix == ".js"]
+    js_files = [
+        js_file for js_file in sorted(input_dir.iterdir()) if js_file.is_file() and js_file.suffix in (".js", ".mjs")
+    ]
 
     with ThreadPoolExecutor(max_workers=args.jobs) as executor:
         executables = [executor.submit(test, js_file.relative_to(input_dir), args.rebaseline) for js_file in js_files]

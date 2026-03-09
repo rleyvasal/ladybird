@@ -380,17 +380,17 @@ GC::Ref<Executable> Generator::compile(VM& vm, ASTNode const& node, FunctionKind
         //     to avoid phantom entries from skipped/replaced instructions.
         //     When a block has multiple source map entries at the same offset
         //     (due to rewind in fuse_compare_and_jump), we use the last one.
-        auto find_source_record = [&block](size_t block_offset) -> SourceRecord {
-            auto const& sm = block->source_map();
-            for (size_t i = sm.size(); i > 0; --i) {
-                if (sm[i - 1].bytecode_offset == static_cast<u32>(block_offset))
-                    return sm[i - 1].source_record;
-            }
-            return {};
-        };
+        auto const& source_map_entries = block->source_map();
+        size_t source_map_cursor = 0;
 
         auto emit_source_map_entry = [&](size_t block_offset) {
-            source_map.append({ static_cast<u32>(bytecode.size()), find_source_record(block_offset) });
+            SourceRecord record = {};
+            while (source_map_cursor < source_map_entries.size() && source_map_entries[source_map_cursor].bytecode_offset <= static_cast<u32>(block_offset)) {
+                if (source_map_entries[source_map_cursor].bytecode_offset == static_cast<u32>(block_offset))
+                    record = source_map_entries[source_map_cursor].source_record;
+                ++source_map_cursor;
+            }
+            source_map.append({ static_cast<u32>(bytecode.size()), record });
         };
 
         Bytecode::InstructionStreamIterator it(block->instruction_stream());
@@ -556,6 +556,8 @@ GC::Ref<Executable> Generator::compile(VM& vm, ASTNode const& node, FunctionKind
     VERIFY(number_of_locals == executable->local_variable_names.size());
     VERIFY(number_of_constants == executable->constants.size());
 
+    executable->fixup_cache_pointers();
+
     generator.m_finished = true;
 
     return executable;
@@ -584,7 +586,16 @@ void Generator::grow(size_t additional_size)
 ScopedOperand Generator::allocate_register()
 {
     if (!m_free_registers.is_empty()) {
-        return ScopedOperand { *this, Operand { m_free_registers.take_last() } };
+        // Always allocate the lowest-numbered free register to ensure
+        // deterministic allocation regardless of operand drop order.
+        size_t min_index = 0;
+        for (size_t i = 1; i < m_free_registers.size(); ++i) {
+            if (m_free_registers[i].index() < m_free_registers[min_index].index())
+                min_index = i;
+        }
+        auto reg = m_free_registers[min_index];
+        m_free_registers.remove(min_index);
+        return ScopedOperand { *this, Operand { reg } };
     }
     VERIFY(m_next_register != NumericLimits<u32>::max());
     return ScopedOperand { *this, Operand { Register { m_next_register++ } } };
@@ -704,6 +715,7 @@ bool Generator::emit_block_declaration_instantiation(ScopeNode const& scope_node
                 auto local_index = function_declaration.name_identifier()->local_index();
                 if (local_index.is_variable()) {
                     emit<Bytecode::Op::Mov>(local(local_index), fo);
+                    set_local_initialized(local_index);
                 } else {
                     VERIFY_NOT_REACHED();
                 }
@@ -847,14 +859,7 @@ Generator::ReferenceOperands Generator::emit_load_from_reference(JS::ASTNode con
         emit<Bytecode::Op::NewReferenceError>(exception, intern_string(ErrorType::InvalidLeftHandAssignment.message()));
         perform_needed_unwinds<Op::Throw>();
         emit<Bytecode::Op::Throw>(exception);
-        switch_to_basic_block(make_block());
-        auto dummy = add_constant(js_undefined());
-        return ReferenceOperands {
-            .base = dummy,
-            .referenced_name = dummy,
-            .this_value = dummy,
-            .loaded_value = dummy,
-        };
+        return ReferenceOperands {};
     }
     auto& expression = static_cast<MemberExpression const&>(node);
 
@@ -981,7 +986,7 @@ void Generator::emit_store_to_reference(JS::ASTNode const& node, ScopedOperand v
             } else {
                 // 3. Let propertyKey be StringValue of IdentifierName.
                 auto property_key_table_index = intern_property_key(as<Identifier>(expression.property()).string());
-                emit<Bytecode::Op::PutNormalByIdWithThis>(*super_reference.base, *super_reference.this_value, property_key_table_index, value, next_property_lookup_cache());
+                emit<Bytecode::Op::PutByIdWithThis>(*super_reference.base, *super_reference.this_value, property_key_table_index, value, Bytecode::PutKind::Normal, next_property_lookup_cache());
             }
         } else {
             auto object = expression.object().generate_bytecode(*this).value();
@@ -1010,7 +1015,6 @@ void Generator::emit_store_to_reference(JS::ASTNode const& node, ScopedOperand v
     emit<Bytecode::Op::NewReferenceError>(exception, intern_string(ErrorType::InvalidLeftHandAssignment.message()));
     perform_needed_unwinds<Op::Throw>();
     emit<Bytecode::Op::Throw>(exception);
-    switch_to_basic_block(make_block());
 }
 
 void Generator::emit_store_to_reference(ReferenceOperands const& reference, ScopedOperand value)
@@ -1023,7 +1027,7 @@ void Generator::emit_store_to_reference(ReferenceOperands const& reference, Scop
         if (reference.base == reference.this_value)
             emit_put_by_id(*reference.base, *reference.referenced_identifier, value, Bytecode::PutKind::Normal, next_property_lookup_cache());
         else
-            emit<Bytecode::Op::PutNormalByIdWithThis>(*reference.base, *reference.this_value, *reference.referenced_identifier, value, next_property_lookup_cache());
+            emit<Bytecode::Op::PutByIdWithThis>(*reference.base, *reference.this_value, *reference.referenced_identifier, value, Bytecode::PutKind::Normal, next_property_lookup_cache());
         return;
     }
     if (reference.base == reference.this_value)
@@ -1057,8 +1061,8 @@ Optional<ScopedOperand> Generator::emit_delete_reference(JS::ASTNode const& node
             perform_needed_unwinds<Op::Throw>();
             emit<Bytecode::Op::Throw>(exception);
 
-            // Switch to a new block so callers can continue emitting code
-            // (which will be unreachable, but avoids a terminated-block VERIFY).
+            // Keep a dead block so callers can continue emitting code.
+            // delete always produces a value, so callers call .value() on our result.
             switch_to_basic_block(make_block());
             return add_constant(js_undefined());
         }
@@ -1440,16 +1444,7 @@ void Generator::emit_get_by_value_with_this(ScopedOperand dst, ScopedOperand bas
 
 void Generator::emit_put_by_id(Operand base, PropertyKeyTableIndex property, Operand src, PutKind kind, u32 cache_index, Optional<IdentifierTableIndex> base_identifier)
 {
-#define EMIT_PUT_BY_ID(kind)                                                                \
-    case PutKind::kind:                                                                     \
-        emit<Op::Put##kind##ById>(base, property, src, cache_index, move(base_identifier)); \
-        break;
-    switch (kind) {
-        JS_ENUMERATE_PUT_KINDS(EMIT_PUT_BY_ID)
-    default:
-        VERIFY_NOT_REACHED();
-    }
-#undef EMIT_PUT_BY_ID
+    emit<Op::PutById>(base, property, src, kind, cache_index, move(base_identifier));
 }
 
 void Generator::emit_put_by_value(ScopedOperand base, ScopedOperand property, ScopedOperand src, Bytecode::PutKind kind, Optional<IdentifierTableIndex> base_identifier)
@@ -1461,16 +1456,7 @@ void Generator::emit_put_by_value(ScopedOperand base, ScopedOperand property, Sc
             return;
         }
     }
-#define EMIT_PUT_BY_VALUE(kind)                                                   \
-    case PutKind::kind:                                                           \
-        emit<Op::Put##kind##ByValue>(base, property, src, move(base_identifier)); \
-        break;
-    switch (kind) {
-        JS_ENUMERATE_PUT_KINDS(EMIT_PUT_BY_VALUE)
-    default:
-        VERIFY_NOT_REACHED();
-    }
-#undef EMIT_PUT_BY_VALUE
+    emit<Op::PutByValue>(base, property, src, kind, move(base_identifier));
 }
 
 void Generator::emit_put_by_value_with_this(ScopedOperand base, ScopedOperand property, ScopedOperand this_value, ScopedOperand src, Bytecode::PutKind kind)
@@ -1478,29 +1464,11 @@ void Generator::emit_put_by_value_with_this(ScopedOperand base, ScopedOperand pr
     if (property.operand().is_constant() && get_constant(property).is_string()) {
         auto property_key = MUST(get_constant(property).to_property_key(vm()));
         if (property_key.is_string()) {
-#define EMIT_PUT_BY_ID_WITH_THIS(kind)                                                                                               \
-    case PutKind::kind:                                                                                                              \
-        emit<Op::Put##kind##ByIdWithThis>(base, this_value, intern_property_key(property_key), src, m_next_property_lookup_cache++); \
-        break;
-            switch (kind) {
-                JS_ENUMERATE_PUT_KINDS(EMIT_PUT_BY_ID_WITH_THIS)
-            default:
-                VERIFY_NOT_REACHED();
-            }
-#undef EMIT_PUT_BY_ID_WITH_THIS
+            emit<Op::PutByIdWithThis>(base, this_value, intern_property_key(property_key), src, kind, m_next_property_lookup_cache++);
             return;
         }
     }
-#define EMIT_PUT_BY_VALUE_WITH_THIS(kind)                                      \
-    case PutKind::kind:                                                        \
-        emit<Op::Put##kind##ByValueWithThis>(base, property, this_value, src); \
-        break;
-    switch (kind) {
-        JS_ENUMERATE_PUT_KINDS(EMIT_PUT_BY_VALUE_WITH_THIS)
-    default:
-        VERIFY_NOT_REACHED();
-    }
-#undef EMIT_PUT_BY_VALUE_WITH_THIS
+    emit<Op::PutByValueWithThis>(base, property, this_value, src, kind);
 }
 
 void Generator::emit_iterator_value(ScopedOperand dst, ScopedOperand result)
@@ -1554,6 +1522,24 @@ bool Generator::is_local_lexically_declared(Identifier::Local const& local) cons
     if (local.is_argument())
         return false;
     return m_local_variables[local.index].declaration_kind == LocalVariable::DeclarationKind::LetOrConst;
+}
+
+void Generator::emit_tdz_check_if_needed(Identifier const& identifier)
+{
+    VERIFY(identifier.is_local());
+    auto local_index = identifier.local_index();
+    bool needs_tdz_check = local_index.is_argument()
+        ? !is_local_initialized(local_index)
+        : is_local_lexically_declared(local_index) && !is_local_initialized(local_index);
+    if (needs_tdz_check) {
+        auto operand = local(local_index);
+        if (local_index.is_argument()) {
+            // Arguments are initialized to undefined by default, so here we need to replace it
+            // with the empty value to trigger the TDZ check.
+            emit<Bytecode::Op::Mov>(operand, add_constant(js_special_empty_value()));
+        }
+        emit<Bytecode::Op::ThrowIfTDZ>(operand);
+    }
 }
 
 ScopedOperand Generator::get_this(Optional<ScopedOperand> preferred_dst)
@@ -1645,8 +1631,21 @@ void Generator::emit_jump_if(ScopedOperand const& condition, Label true_target, 
 
 ScopedOperand Generator::copy_if_needed_to_preserve_evaluation_order(ScopedOperand const& operand)
 {
-    if (!operand.operand().is_local())
+    auto might_be_clobbered = [operand]() {
+        switch (operand.operand().type()) {
+        case Operand::Type::Register:
+        case Operand::Type::Constant:
+            return false;
+        case Operand::Type::Local:
+        case Operand::Type::Argument:
+            return true;
+        }
+        VERIFY_NOT_REACHED();
+    }();
+
+    if (!might_be_clobbered)
         return operand;
+
     auto new_register = allocate_register();
     emit<Bytecode::Op::Mov>(new_register, operand);
     return new_register;

@@ -16,11 +16,13 @@ namespace JS {
 FunctionObject::FunctionObject(Realm& realm, Object* prototype, MayInterfereWithIndexedPropertyAccess may_interfere_with_indexed_property_access)
     : Object(realm, prototype, may_interfere_with_indexed_property_access)
 {
+    set_is_function();
 }
 
 FunctionObject::FunctionObject(Object& prototype, MayInterfereWithIndexedPropertyAccess may_interfere_with_indexed_property_access)
     : Object(ConstructWithPrototypeTag::Tag, prototype, may_interfere_with_indexed_property_access)
 {
+    set_is_function();
 }
 
 // 10.2.9 SetFunctionName ( F, name [ , prefix ] ), https://tc39.es/ecma262/#sec-setfunctionname
@@ -53,9 +55,11 @@ GC::Ref<PrimitiveString> FunctionObject::make_function_name(Variant<PropertyKey,
     }
 
     // 4. If F has an [[InitialName]] internal slot, then
-    if (is<NativeFunction>(this)) {
+    auto* native_function = as_if<NativeFunction>(this);
+
+    if (native_function) {
         // a. Set F.[[InitialName]] to name.
-        static_cast<NativeFunction&>(*this).set_initial_name({}, name);
+        native_function->set_initial_name({}, name);
     }
 
     // 5. If prefix is present, then
@@ -64,9 +68,9 @@ GC::Ref<PrimitiveString> FunctionObject::make_function_name(Variant<PropertyKey,
         name = Utf16String::formatted("{} {}", *prefix, name);
 
         // b. If F has an [[InitialName]] internal slot, then
-        if (is<NativeFunction>(this)) {
+        if (native_function) {
             // i. Optionally, set F.[[InitialName]] to name.
-            static_cast<NativeFunction&>(*this).set_initial_name({}, name);
+            native_function->set_initial_name({}, name);
         }
     }
 
@@ -79,7 +83,7 @@ void FunctionObject::set_function_name(Variant<PropertyKey, PrivateName> const& 
     auto& vm = this->vm();
 
     // 1. Assert: F is an extensible object that does not have a "name" own property.
-    VERIFY(m_is_extensible);
+    VERIFY(extensible());
     VERIFY(!storage_has(vm.names.name));
 
     auto name = make_function_name(name_arg, prefix);
@@ -100,7 +104,7 @@ void FunctionObject::set_function_length(double length)
     VERIFY(trunc(length) == length || __builtin_isinf_sign(length) == 1);
 
     // 1. Assert: F is an extensible object that does not have a "length" own property.
-    VERIFY(m_is_extensible);
+    VERIFY(extensible());
     VERIFY(!storage_has(vm.names.length));
 
     // 2. Perform ! DefinePropertyOrThrow(F, "length", PropertyDescriptor { [[Value]]: 𝔽(length), [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: true }).

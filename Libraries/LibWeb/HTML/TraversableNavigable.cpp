@@ -930,7 +930,7 @@ TraversableNavigable::CheckIfUnloadingIsCanceledResult TraversableNavigable::che
             IGNORE_USE_IN_ESCAPING_LAMBDA auto events_fired = false;
 
             // 2. Let needsBeforeunload be true if navigablesThatNeedBeforeUnload contains traversable; otherwise false.
-            auto it = navigables_that_need_before_unload.find_if([&traversable](GC::Root<Navigable> navigable) {
+            auto it = navigables_that_need_before_unload.find_if([&traversable](auto const& navigable) {
                 return navigable.ptr() == traversable.ptr();
             });
             auto needs_beforeunload = it != navigables_that_need_before_unload.end();
@@ -1440,6 +1440,8 @@ void TraversableNavigable::process_screenshot_requests()
         auto task = m_screenshot_tasks.dequeue();
         if (task.node_id.has_value()) {
             auto* dom_node = DOM::Node::from_unique_id(*task.node_id);
+            if (dom_node)
+                dom_node->document().update_layout(DOM::UpdateLayoutReason::ProcessScreenshot);
             if (!dom_node || !dom_node->paintable_box()) {
                 client.page_did_take_screenshot({});
                 continue;
@@ -1457,6 +1459,7 @@ void TraversableNavigable::process_screenshot_requests()
                 client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
             });
         } else {
+            active_document()->update_layout(DOM::UpdateLayoutReason::ProcessScreenshot);
             auto scrollable_overflow_rect = active_document()->layout_node()->paintable_box()->scrollable_overflow_rect();
             auto rect = page().enclosing_device_rect(scrollable_overflow_rect.value());
             auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, rect.size().to_type<int>());

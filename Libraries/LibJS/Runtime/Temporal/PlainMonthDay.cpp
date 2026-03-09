@@ -32,13 +32,9 @@ ThrowCompletionOr<GC::Ref<PlainMonthDay>> to_temporal_month_day(VM& vm, Value it
     // 1. If options is not present, set options to undefined.
 
     // 2. If item is an Object, then
-    if (item.is_object()) {
-        auto const& object = item.as_object();
-
+    if (auto object = item.as_if<Object>()) {
         // a. If item has an [[InitializedTemporalMonthDay]] internal slot, then
-        if (is<PlainMonthDay>(object)) {
-            auto const& plain_month_day = static_cast<PlainMonthDay const&>(object);
-
+        if (auto const* plain_month_day = as_if<PlainMonthDay>(*object)) {
             // i. Let resolvedOptions be ? GetOptionsObject(options).
             auto resolved_options = TRY(get_options_object(vm, options));
 
@@ -46,14 +42,14 @@ ThrowCompletionOr<GC::Ref<PlainMonthDay>> to_temporal_month_day(VM& vm, Value it
             TRY(get_temporal_overflow_option(vm, resolved_options));
 
             // iii. Return ! CreateTemporalMonthDay(item.[[ISODate]], item.[[Calendar]]).
-            return MUST(create_temporal_month_day(vm, plain_month_day.iso_date(), plain_month_day.calendar()));
+            return MUST(create_temporal_month_day(vm, plain_month_day->iso_date(), plain_month_day->calendar()));
         }
 
         // b. Let calendar be ? GetTemporalCalendarIdentifierWithISODefault(item).
-        auto calendar = TRY(get_temporal_calendar_identifier_with_iso_default(vm, object));
+        auto calendar = TRY(get_temporal_calendar_identifier_with_iso_default(vm, *object));
 
         // c. Let fields be ? PrepareCalendarFields(calendar, item, « YEAR, MONTH, MONTH-CODE, DAY », «», «»).
-        auto fields = TRY(prepare_calendar_fields(vm, calendar, object, { { CalendarField::Year, CalendarField::Month, CalendarField::MonthCode, CalendarField::Day } }, {}, CalendarFieldList {}));
+        auto fields = TRY(prepare_calendar_fields(vm, calendar, *object, { { CalendarField::Year, CalendarField::Month, CalendarField::MonthCode, CalendarField::Day } }, {}, CalendarFieldList {}));
 
         // d. Let resolvedOptions be ? GetOptionsObject(options).
         auto resolved_options = TRY(get_options_object(vm, options));

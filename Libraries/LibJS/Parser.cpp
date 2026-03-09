@@ -254,7 +254,8 @@ NonnullRefPtr<Program> Parser::parse_program(bool starts_in_strict_mode)
             parse_module(program);
     }
 
-    scope_collector().analyze();
+    compile_regex_literals();
+    scope_collector().analyze(m_is_dynamic_function);
 
     program->set_end_offset({}, position().offset);
     return program;
@@ -495,6 +496,11 @@ RefPtr<FunctionExpression const> Parser::try_parse_arrow_function_expression(boo
             return nullptr;
     }
 
+    // Save ancestor function scope flags before speculative parsing.
+    // If arrow parsing fails, set_uses_this() may have propagated flags
+    // to ancestor function scopes that must be restored.
+    auto saved_ancestor_flags = scope_collector().save_ancestor_flags();
+
     save_state();
     auto rule_start = (expect_parens && !is_async)
         // Someone has consumed the opening parenthesis for us! Start there.
@@ -504,6 +510,7 @@ RefPtr<FunctionExpression const> Parser::try_parse_arrow_function_expression(boo
 
     ArmedScopeGuard state_rollback_guard = [&] {
         load_state();
+        scope_collector().restore_ancestor_flags(saved_ancestor_flags);
     };
 
     auto function_kind = FunctionKind::Normal;
@@ -846,6 +853,7 @@ NonnullRefPtr<ClassExpression const> Parser::parse_class_expression(bool expect_
 
     if (match(TokenType::Extends)) {
         consume();
+        auto extends_start = push_start();
         auto primary = parse_primary_expression();
         auto expression = move(primary.result);
         auto should_continue_parsing = primary.should_continue_parsing_as_expression;
@@ -854,7 +862,7 @@ NonnullRefPtr<ClassExpression const> Parser::parse_class_expression(bool expect_
         for (;;) {
             if (match(TokenType::TemplateLiteralStart)) {
                 auto template_literal = parse_template_literal(true);
-                expression = create_ast_node<TaggedTemplateLiteral>({ m_source_code, rule_start.position(), position() }, move(expression), move(template_literal));
+                expression = create_ast_node<TaggedTemplateLiteral>({ m_source_code, extends_start.position(), position() }, move(expression), move(template_literal));
                 continue;
             }
             if (match(TokenType::BracketOpen) || match(TokenType::Period) || match(TokenType::ParenOpen)) {
@@ -917,8 +925,12 @@ NonnullRefPtr<ClassExpression const> Parser::parse_class_expression(bool expect_
                     is_static = true;
                     function_start = position();
                     if (match(TokenType::Async)) {
-                        consume();
-                        is_async = true;
+                        auto lookahead_token = next_token();
+                        if (lookahead_token.type() != TokenType::Semicolon && lookahead_token.type() != TokenType::CurlyClose && lookahead_token.type() != TokenType::ParenOpen
+                            && !lookahead_token.trivia_contains_line_terminator()) {
+                            consume();
+                            is_async = true;
+                        }
                     }
                     if (match(TokenType::Asterisk)) {
                         consume();
@@ -1354,21 +1366,10 @@ NonnullRefPtr<RegExpLiteral const> Parser::parse_regexp_literal()
             parsed_flags = parsed_flags_or_error.release_value();
     }
 
-    String parsed_pattern;
-    auto parsed_pattern_result = parse_regex_pattern(pattern, parsed_flags.has_flag_set(ECMAScriptFlags::Unicode), parsed_flags.has_flag_set(ECMAScriptFlags::UnicodeSets));
-    if (parsed_pattern_result.is_error()) {
-        syntax_error(parsed_pattern_result.release_error().error, rule_start.position());
-        parsed_pattern = ""_string;
-    } else {
-        parsed_pattern = parsed_pattern_result.release_value();
-    }
-    auto parsed_regex = Regex<ECMA262>::parse_pattern(parsed_pattern, parsed_flags);
-
-    if (parsed_regex.error != regex::Error::NoError)
-        syntax_error(MUST(String::formatted("RegExp compile error: {}", Regex<ECMA262>(parsed_regex, parsed_pattern.to_byte_string(), parsed_flags).error_string())), rule_start.position());
-
     SourceRange range { m_source_code, rule_start.position(), position() };
-    return create_ast_node<RegExpLiteral>(move(range), move(parsed_regex), move(parsed_pattern), parsed_flags, move(pattern), move(flags));
+    auto literal = create_ast_node<RegExpLiteral>(move(range), move(pattern), move(flags), parsed_flags);
+    m_deferred_regex_literals.append({ literal, rule_start.position() });
+    return literal;
 }
 
 static bool is_simple_assignment_target(Expression const& expression, bool allow_web_reality_call_expression = true)
@@ -1512,6 +1513,7 @@ Parser::PrimaryExpressionParseResult Parser::parse_object_expression()
         property_type = ObjectProperty::Type::KeyValue;
         RefPtr<Expression const> property_key;
         RefPtr<Expression const> property_value;
+        RefPtr<Identifier> shorthand_identifier;
         FunctionKind function_kind { FunctionKind::Normal };
 
         if (match(TokenType::TripleDot)) {
@@ -1554,7 +1556,11 @@ Parser::PrimaryExpressionParseResult Parser::parse_object_expression()
                 property_key = parse_property_key();
             } else {
                 property_key = create_ast_node<StringLiteral>({ m_source_code, rule_start.position(), position() }, identifier.fly_string_value().to_utf16_string());
-                property_value = create_identifier_and_register_in_current_scope({ m_source_code, rule_start.position(), position() }, identifier.fly_string_value());
+                // NB: Don't register the identifier in the scope collector yet.
+                // If this turns out to be a shorthand property, we'll register it
+                // below. Otherwise (key: value), the identifier is unused.
+                shorthand_identifier = create_ast_node<Identifier>({ m_source_code, rule_start.position(), position() }, identifier.fly_string_value());
+                property_value = shorthand_identifier;
             }
         } else {
             property_key = parse_property_key();
@@ -1620,6 +1626,12 @@ Parser::PrimaryExpressionParseResult Parser::parse_object_expression()
                 if (is_strict_reserved_word(string_literal.value()))
                     syntax_error(MUST(String::formatted("'{}' is a reserved keyword", string_literal.value())));
             }
+
+            // NB: This is a shorthand property ({x}), so now register the
+            // identifier in the scope collector. We deferred this from above
+            // to avoid registering identifiers for key: value properties.
+            if (scope_collector().has_current_scope())
+                scope_collector().register_identifier(*shorthand_identifier, {});
 
             properties.append(create_ast_node<ObjectProperty>({ m_source_code, rule_start.position(), position() }, *property_key, *property_value, property_type, false));
         } else {
@@ -3451,6 +3463,7 @@ NonnullRefPtr<Statement const> Parser::parse_for_statement()
 
         if (match_for_using_declaration()) {
             auto declaration = parse_using_declaration(IsForLoopVariableDeclaration::Yes);
+            scope_collector().add_declaration(declaration);
 
             if (match_of(m_state.current_token())) {
                 if (declaration->declarations().size() != 1)
@@ -4031,20 +4044,44 @@ void Parser::syntax_error(String const& message, Optional<Position> position)
     m_state.errors.append({ message, position });
 }
 
+void Parser::compile_regex_literals()
+{
+    for (auto& deferred : m_deferred_regex_literals) {
+        auto const& pattern = deferred.literal->pattern();
+        auto const& parsed_flags = deferred.literal->parsed_flags();
+        auto parsed_pattern_result = parse_regex_pattern(pattern, parsed_flags.has_flag_set(ECMAScriptFlags::Unicode), parsed_flags.has_flag_set(ECMAScriptFlags::UnicodeSets));
+        String parsed_pattern;
+        if (parsed_pattern_result.is_error()) {
+            syntax_error(parsed_pattern_result.release_error().error, deferred.position);
+            parsed_pattern = ""_string;
+        } else {
+            parsed_pattern = parsed_pattern_result.release_value();
+        }
+        auto parsed_regex = Regex<ECMA262>::parse_pattern(parsed_pattern, parsed_flags);
+        if (parsed_regex.error != regex::Error::NoError)
+            syntax_error(MUST(String::formatted("RegExp compile error: {}", Regex<ECMA262>(parsed_regex, parsed_pattern.to_byte_string(), parsed_flags).error_string())), deferred.position);
+        deferred.literal->set_compiled_regex(move(parsed_regex), move(parsed_pattern));
+    }
+    m_deferred_regex_literals.clear();
+}
+
 void Parser::save_state()
 {
     m_saved_state.append(m_state);
+    m_saved_deferred_regex_sizes.append(m_deferred_regex_literals.size());
 }
 
 void Parser::load_state()
 {
     VERIFY(!m_saved_state.is_empty());
     m_state = m_saved_state.take_last();
+    m_deferred_regex_literals.shrink(m_saved_deferred_regex_sizes.take_last());
 }
 
 void Parser::discard_saved_state()
 {
     m_saved_state.take_last();
+    m_saved_deferred_regex_sizes.take_last();
 }
 
 void Parser::check_identifier_name_for_assignment_validity(Utf16FlyString const& name, bool force_strict)
@@ -4148,6 +4185,7 @@ NonnullRefPtr<ImportStatement const> Parser::parse_import_statement(Program& pro
     if (match(TokenType::StringLiteral)) {
         //  import ModuleSpecifier ;
         auto module_request = parse_module_request();
+        consume_or_insert_semicolon();
         return create_ast_node<ImportStatement>({ m_source_code, rule_start.position(), position() }, move(module_request));
     }
 
@@ -4270,6 +4308,7 @@ NonnullRefPtr<ImportStatement const> Parser::parse_import_statement(Program& pro
         syntax_error(MUST(String::formatted("Expected 'from' got {}", from_statement)));
 
     auto module_request = parse_module_request();
+    consume_or_insert_semicolon();
 
     Vector<ImportEntry> entries;
     entries.ensure_capacity(entries_with_location.size());
@@ -4429,12 +4468,6 @@ NonnullRefPtr<ExportStatement const> Parser::parse_export_statement(Program& pro
 
             if (!special_case_declaration_without_name)
                 consume_or_insert_semicolon();
-
-            if (is<ClassExpression>(*expression)) {
-                auto const& class_expression = static_cast<ClassExpression const&>(*expression);
-                if (class_expression.has_name())
-                    local_name = class_expression.name();
-            }
         } else {
             expected("Declaration or assignment expression");
             local_name = "!!invalid!!"_utf16_fly_string;
@@ -4700,7 +4733,7 @@ Parser Parser::parse_function_body_from_string(ByteString const& body_string, u1
         function_body = body_parser.parse_function_body(move(parameters), kind, parsing_insights);
     }
 
-    body_parser.scope_collector().analyze();
+    body_parser.run_scope_analysis();
 
     return body_parser;
 }

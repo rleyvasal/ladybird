@@ -12,6 +12,7 @@
 #include <LibWeb/HTML/HTMLLabelElement.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
 
 namespace Web::HTML {
@@ -53,6 +54,11 @@ void HTMLLabelElement::activation_behavior(DOM::Event const& event)
     if (!control_element)
         return;
 
+    // NB: If the click resulted in a selection being made on the label element, do not propagate the click event to the
+    //     input element. This allows the user to e.g. copy the label's text.
+    if (auto selection = document().get_selection(); selection && !selection->is_collapsed())
+        return;
+
     if (auto* form_control = as_if<FormAssociatedElement>(*control_element)) {
         if (!form_control->enabled())
             return;
@@ -64,6 +70,9 @@ void HTMLLabelElement::activation_behavior(DOM::Event const& event)
 
         auto const& mouse_event = as<UIEvents::MouseEvent>(event);
         auto click_event = mouse_event.clone();
+
+        // NB: Ensure layout is up to date before accessing the control's paintable.
+        document().update_layout(DOM::UpdateLayoutReason::HTMLLabelElementActivationBehavior);
 
         // Recompute offsetX/offsetY relative to the control element, since the original values are relative to the label.
         if (auto const* paintable = control_element->paintable(); paintable && document().navigable()) {
