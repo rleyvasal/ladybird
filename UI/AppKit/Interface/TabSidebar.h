@@ -10,7 +10,7 @@
 @interface TabSidebar : NSView
 
 - (instancetype)init;
-- (void)addTabButton:(NSString*)title;
+- (void)addTabButton:(NSString*)title favicon:(NSImage*)favicon;
 
 @end
 

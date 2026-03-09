@@ -418,7 +418,7 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
     // Create sidebar
     self.sidebar = [[TabSidebar alloc] init];
     CGFloat toolbarHeight = 52;  // TODO: make dynamic
-    [self.sidebar setFrame:NSMakeRect(8, 8, 0, self.window.frame.size.height - toolbarHeight - 16)];
+    [self.sidebar setFrame:NSMakeRect(8, 8, 50, self.window.frame.size.height - toolbarHeight - 16)];
     [[self.window contentView] addSubview:self.sidebar];
 
     // Add tracking area for hover detection
@@ -443,7 +443,7 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
         self.isResizing = YES;
         // Collapse sidebar immediately
         CGFloat toolbarHeight = 52;
-        [self.sidebar setFrame:NSMakeRect(8, 8, 0, self.window.frame.size.height - toolbarHeight - 16)];
+        [self.sidebar setFrame:NSMakeRect(8, 8, 50, self.window.frame.size.height - toolbarHeight - 16)];
     }
 }
 
@@ -534,7 +534,7 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
 
     // Collapse sidebar during resize
     CGFloat toolbarHeight = 52;  // TODO: make dynamic
-    [self.sidebar setFrame:NSMakeRect(8, 8, 0, self.window.frame.size.height - toolbarHeight - 16)];
+    [self.sidebar setFrame:NSMakeRect(8, 8, 50, self.window.frame.size.height - toolbarHeight - 16)];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         self.isResizing = NO;
@@ -691,6 +691,8 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
 }
 
 @end
+
+
 
 
 

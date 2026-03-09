@@ -20,11 +20,17 @@
     return self;
 }
 
-- (void)addTabButton:(NSString*)title
+- (void)addTabButton:(NSString*)title favicon:(NSImage*)favicon
 {
-    auto* button = [NSButton buttonWithTitle:title target:nil action:nil];
+    auto* button = [NSButton buttonWithImage:favicon target:nil action:nil];
+    [button setToolTip:title];
+    [button setImageScaling:NSImageScaleProportionallyDown];
+    [button setBordered:NO];
+    [button setFrame:NSMakeRect(5, 5, 40, 40)];
     [self addSubview:button];
 }
 
 @end
+
+
 
